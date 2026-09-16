@@ -23,7 +23,7 @@ def verify_projexa_token(token: str) -> dict:
         raise HTTPException(401, "invalid Projexa attendance token") from exc
     scopes = set(claims.get("scope", []))
     roles = set(claims.get("roles", []))
-    if "attendance:read" not in scopes or "faculty" not in roles:
+    if "attendance:read" not in scopes or not roles.intersection({"faculty", "mentor", "admin"}):
         raise HTTPException(403, "attendance access is not permitted")
     return claims
 
@@ -32,7 +32,9 @@ async def projexa_auth_middleware(request: Request, call_next):
     if PROJEXA_AUTH_MODE != "projexa":
         return await call_next(request)
     public_paths = {"/health", "/health/live", "/health/ready"}
-    if request.url.path in public_paths:
+    if request.url.path in public_paths or request.url.path in {
+        "/sessions/token", "/sessions/link/request-otp",
+    }:
         return await call_next(request)
     authorization = request.headers.get("Authorization", "")
     if not authorization.startswith("Bearer "):

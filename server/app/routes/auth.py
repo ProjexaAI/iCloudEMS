@@ -77,6 +77,34 @@ def start_from_projexa_token(request: Request):
     )
 
 
+def _projexa_email_session(request: Request):
+    authorization = request.headers.get("Authorization", "")
+    if not authorization.startswith("Bearer "):
+        raise HTTPException(401, "Projexa bearer token required")
+    claims = verify_projexa_token(authorization[7:].strip())
+    email = (claims.get("email") or "").strip().lower()
+    if not email:
+        raise HTTPException(400, "Projexa token has no email claim")
+    sid, client = store.create()
+    store.set_identity(sid, str(claims["sub"]))
+    store.set_email(sid, email)
+    client.contact = email
+    client._token_store = token_store
+    return sid, client, email
+
+
+@router.post("/link/request-otp", response_model=StartLoginResponse)
+def request_link_otp(request: Request):
+    sid, client, email = _projexa_email_session(request)
+    data = client.send_otp(email)
+    if data.get("status") != "success":
+        store.delete(sid)
+        raise HTTPException(400, detail="iCloudEMS OTP request failed")
+    return StartLoginResponse(
+        session_id=sid, state="otp_sent", email=email, empid=None,
+    )
+
+
 @router.post("/{sid}/verify", response_model=VerifyOtpResponse)
 def verify(sid: str, req: VerifyOtpRequest):
     client = store.get(sid)
