@@ -96,6 +96,28 @@ def _projexa_email_session(request: Request):
 @router.post("/link/request-otp", response_model=StartLoginResponse)
 def request_link_otp(request: Request):
     sid, client, email = _projexa_email_session(request)
+
+    # Try restoring iCloudEMS tokens from DB before resorting to OTP
+    restored = client.load_from_store(token_store, email)
+
+    if restored and ICloudEMSClient.token_is_valid(client.access_token):
+        return StartLoginResponse(
+            session_id=sid, state="ready",
+            email=email, empid=client.empid,
+        )
+
+    if restored and client.refresh_token:
+        try:
+            client.refresh()
+            client.save_to_store(token_store, email)
+            return StartLoginResponse(
+                session_id=sid, state="ready",
+                email=email, empid=client.empid,
+            )
+        except Exception:
+            client.clear_session(keep_device_id=True)
+
+    # No valid stored tokens — fall back to OTP
     data = client.send_otp(email)
     if data.get("status") != "success":
         store.delete(sid)
