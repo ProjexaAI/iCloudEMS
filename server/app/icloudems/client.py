@@ -264,7 +264,7 @@ class ICloudEMSClient:
             r = self.session.get(self.KRMU_HOST + "/", timeout=15)
             self._log("GET krmu / ->", r.status_code)
         except Exception as e:
-            self._log("warmup failed:", e)
+            self._log(f"warmup failed: {type(e).__name__}: {e}")
         if self.plain_session is not None:
             try:
                 for k, v in self.session.cookies_dict().items():
@@ -300,7 +300,9 @@ class ICloudEMSClient:
                         "ctrl_tt_report_emp_rum.php"),
             timeout=60,
         )
-        self._log(f"POST ctrl_tt_report ({action} {start_date}..{end_date}) ->", r.status_code)
+        self._log(f"POST ctrl_tt_report ({action} {start_date}..{end_date}) -> {r.status_code}")
+        if not r.ok:
+            self._log(f"  response body: {r.text[:1000]}")
         r.raise_for_status()
         return r.json()
 
