@@ -260,7 +260,145 @@ class ICloudEMSClient:
                 self.empid = claims["admno"]
         return data
 
+    # ---------- proxy instruction builders ----------
+
+    def build_proxy_timetable(self, empid, start_date, end_date, action="wdefault"):
+        """Return a dict the mobile app uses to execute a timetable fetch."""
+        return {
+            "method": "POST",
+            "url": f"{self.KRMU_HOST}/corecampus/admin/schedulerand/ctrl_tt_report_emp_rum.php",
+            "headers": self._auth_headers(
+                referer="corecampus/admin/schedulerand/ctrl_tt_report_emp_rum.php"),
+            "json_body": {
+                "action": action,
+                "attendanceFlag": 1,
+                "client": self.CLIENT,
+                "empid": str(empid),
+                "endDate": end_date,
+                "from": "app",
+                "method": "getData",
+                "room": "",
+                "startDate": start_date,
+                "br_id": self.BR_ID,
+            },
+        }
+
+    def build_proxy_timetable_tasks(self, empid, start_date, end_date):
+        """Return a list of proxy instructions covering the date range week-by-week."""
+        from datetime import datetime, timedelta
+        dt_start = datetime.strptime(start_date, "%Y-%m-%d")
+        dt_end = datetime.strptime(end_date, "%Y-%m-%d")
+        weeks = []
+        current_monday = dt_start - timedelta(days=dt_start.weekday())
+        end_sunday = dt_end + timedelta(days=(6 - dt_end.weekday()))
+        while current_monday <= end_sunday:
+            week_sunday = current_monday + timedelta(days=6)
+            weeks.append((
+                current_monday.strftime("%Y-%m-%d"),
+                week_sunday.strftime("%Y-%m-%d"),
+            ))
+            current_monday += timedelta(days=7)
+        today = datetime.now()
+        current_week_monday = (today - timedelta(days=today.weekday())).strftime("%Y-%m-%d")
+        tasks = []
+        for mon, sun in weeks:
+            if mon < current_week_monday:
+                next_mon = (datetime.strptime(mon, "%Y-%m-%d") + timedelta(days=7)).strftime("%Y-%m-%d")
+                next_sun = (datetime.strptime(sun, "%Y-%m-%d") + timedelta(days=7)).strftime("%Y-%m-%d")
+                t = self.build_proxy_timetable(empid, next_mon, next_sun, action="previous")
+            else:
+                t = self.build_proxy_timetable(empid, mon, sun, action="wdefault")
+            t["meta"] = {"route": "timetable", "date": start_date,
+                         "start_date": mon, "end_date": sun}
+            tasks.append(t)
+        return tasks
+
+    def build_proxy_roster(self, empid, entry, tt_array_data):
+        """Return a proxy instruction for fetching a slot's roster."""
+        return {
+            "method": "POST",
+            "url": f"{self.KRMU_HOST}/corecampus/admin/attendance/ctrl_attendanceTaken.php",
+            "headers": self._auth_headers(
+                referer="corecampus/admin/attendance/ctrl_attendanceTaken.php"),
+            "json_body": {
+                "from": "app",
+                "method": "getAttendanceDefault",
+                "classid": str(entry.get("classid") or entry.get("classId")),
+                "fromtime": entry.get("fromTime"),
+                "totime": entry.get("toTime"),
+                "date": entry.get("fromDate"),
+                "division": entry.get("division"),
+                "subjectId": str(entry.get("subjectId")),
+                "batchId": str(entry.get("batchGroupId") or entry.get("batch")),
+                "ttArrayData": tt_array_data,
+                "containerId": str(entry.get("containerId", "0")),
+                "empid": str(empid),
+                "br_id": self.BR_ID,
+                "client": self.CLIENT,
+                "attendTakenFlag": 1,
+            },
+            "meta": {"route": "roster", "entry": entry},
+        }
+
+    def build_proxy_submit(self, empid, entry, students, present_admno,
+                           academicyear, update_id, idempotency_key=None):
+        """Return a proxy instruction for submitting attendance."""
+        if len(students) >= 10 and len(present_admno) <= 1:
+            raise ValueError(
+                f"Safety: refusing submit where only {len(present_admno)} "
+                f"of {len(students)} are present"
+            )
+        payload = {
+            "fromTime": entry.get("fromTime"),
+            "toTime": entry.get("toTime"),
+            "priv_id": str(empid),
+            "extra_lec": "0",
+            "exatraLecRem": "",
+            "division": entry.get("division"),
+            "classId": str(entry.get("classid") or entry.get("classId")),
+            "branch_id": int(entry.get("br_id") or self.BR_ID),
+            "batchId": str(entry.get("batchGroupId") or entry.get("batch")),
+            "subjectId": str(entry.get("subjectId")),
+            "attdate": entry.get("fromDate"),
+            "academicyear": academicyear,
+            "adm": {s: s for s in students},
+            "absent_rollno": list(present_admno),
+            "remark": {s: "None" for s in students},
+            "teachingplan_lec": "0",
+            "containerId": str(entry.get("containerId", "0")),
+            "copyAttTime": {},
+            "updateId": str(update_id) if update_id not in (None, "", 0) else "0",
+        }
+        return {
+            "method": "POST_MULTIPART",
+            "url": f"{self.KRMU_HOST}/corecampus/admin/attendance/attendanceTakenSubmit.php",
+            "headers": {
+                "Authorization": self.access_token or "",
+                "Referer": "corecampus/admin/attendance/attendanceTakenSubmit.php",
+                "Origin": self.KRMU_HOST,
+                "Accept": "application/json",
+                "User-Agent": self.USER_AGENT,
+            },
+            "form_data": {
+                "code": self.CLIENT,
+                "client": self.CLIENT,
+                "from": "app",
+                "jwt_token": self.access_token or "",
+                "sessionId": str(uuid.uuid4()),
+                "json": json.dumps(payload),
+            },
+            "meta": {
+                "route": "submit",
+                "entry": entry,
+                "all_admno": list(students),
+                "present_admno": list(present_admno),
+                "update_id": update_id,
+                "idempotency_key": idempotency_key,
+            },
+        }
+
     # ---------- corecampus ----------
+
 
     def warmup(self):
         if self._warmed:

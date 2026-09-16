@@ -197,11 +197,25 @@ def parse_roster(response):
 
     DO NOT default `present` to True for unknown rows — see quirks.md #5.
     """
-    try:
-        data = response.json()
-    except ValueError:
-        _log("[roster] response is not JSON")
+    import json
+    data = None
+    if isinstance(response, (dict, list)):
+        data = response
+    elif hasattr(response, "json"):
+        try:
+            data = response.json()
+        except Exception:
+            pass
+    elif isinstance(response, str):
+        try:
+            data = json.loads(response)
+        except Exception:
+            pass
+
+    if data is None:
+        _log("[roster] response could not be decoded as JSON")
         return [], None, False
+
 
     candidates = _find_student_list(data)
     update_id = _extract_update_id(data)

@@ -273,6 +273,72 @@ class MirrorStore:
             "last_synced": row[5].isoformat() if row[5] else None,
         } for row in rows]
 
+    def get_timetable(self, empid, date_from, date_to=None, max_age_seconds=None):
+        date_to = date_to or date_from
+        query = """
+            SELECT entry, synced_at
+            FROM timetable_entries
+            WHERE empid = %s AND from_date BETWEEN %s AND %s
+            ORDER BY from_date, entry->>'fromTime'
+        """
+        with closing(self._connect()) as conn:
+            with conn.cursor() as cur:
+                cur.execute(query, (str(empid), date_from, date_to))
+                rows = cur.fetchall()
+        if not rows:
+            return None
+        now = datetime.now(timezone.utc)
+        if max_age_seconds is not None:
+            if any((now - synced_at).total_seconds() > max_age_seconds for _, synced_at in rows):
+                return None
+        return [row[0] for row in rows]
+
+    def save_timetable_entries(self, empid, entries):
+        if not entries:
+            return
+        now = datetime.now(timezone.utc)
+        with self._lock, closing(self._connect()) as conn:
+            with conn.cursor() as cur:
+                for e in entries:
+                    if not isinstance(e, dict) or not e.get("fromDate"):
+                        continue
+                    cls = e.get("classid") or e.get("classId") or ""
+                    subject = e.get("subjectId") or ""
+                    division = e.get("division") or ""
+                    batch = e.get("batchGroupId") or e.get("batch") or ""
+                    container = e.get("containerId") or ""
+                    slot_key = (f"{e.get('fromDate')}|{e.get('fromTime')}|{e.get('toTime')}|"
+                                f"{cls}|{subject}|{division}|{batch}|{container}")
+                    cur.execute("""
+                        INSERT INTO timetable_entries (empid, slot_key, from_date, entry, synced_at)
+                        VALUES (%s, %s, %s, %s, %s)
+                        ON CONFLICT (empid, slot_key) DO UPDATE SET
+                            from_date = EXCLUDED.from_date, entry = EXCLUDED.entry,
+                            synced_at = EXCLUDED.synced_at
+                    """, (str(empid), slot_key, e.get("fromDate"), self._jsonb(e), now))
+            conn.commit()
+
+    def save_raw_timetable(self, empid, timetable_json):
+        if not timetable_json:
+            return []
+        emp_tt = (timetable_json or {}).get("emp_timetable", {}) or {}
+        from_flat = list(emp_tt.get("") or [])
+        from_newtt = []
+        newtt = emp_tt.get("NEWTT", {}) or {}
+        if isinstance(newtt, dict):
+            for _day, by_from in newtt.items():
+                if not isinstance(by_from, dict):
+                    continue
+                for _ft, by_to in by_from.items():
+                    if not isinstance(by_to, dict):
+                        continue
+                    for _tt, entries in by_to.items():
+                        if isinstance(entries, list):
+                            from_newtt.extend(entries)
+        all_raw = from_flat + from_newtt
+        self.save_timetable_entries(empid, all_raw)
+        return all_raw
+
     def has_fresh_sync(self, empid, date_from, date_to):
         with closing(self._connect()) as conn:
             with conn.cursor() as cur:

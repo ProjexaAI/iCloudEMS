@@ -1,10 +1,92 @@
 # iCloudEMS Server Integration Guide
 
-This document describes how an external platform should integrate with the iCloudEMS server.
+This document describes how an external platform (such as the Projexa mobile app or desktop client) should integrate with the iCloudEMS server.
 
-The platform should communicate only with this API. It must not call iCloudEMS directly or depend on provider-specific fields such as `takenAttdId`, `absent_rollno`, `ttArrayData`, raw JWTs, or provider authentication headers.
+The platform should communicate only with this API. It must not manually parse provider-specific fields such as `takenAttdId`, `absent_rollno`, `ttArrayData`, raw JWTs, or provider authentication quirks.
+
+## Cloud Deployment & Client-as-Proxy Relay Architecture
+
+When the iCloudEMS server is deployed on cloud hosting or VPS (AWS, GCP, DigitalOcean, Hetzner), iCloudEMS's upstream firewall/WAF blocks requests coming directly from datacenter IP addresses.
+
+To bypass this restriction seamlessly, the platform uses a **Client-as-Proxy / Fetch-Task Relay** pattern. The client device (phone on cellular or campus Wi-Fi, with a trusted residential IP) acts as an upstream relay for cache misses and write operations:
+
+```text
+Client (Phone / Trusted IP)                Your Server (Cloud VPS)               iCloudEMS Upstream
+     │                                                │                                  │
+     ├─ 1. GET /timetable?date=... ──────────────────►│                                  │
+     │     (Header: X-Client-Relay: true)             │                                  │
+     │                                                ├─ cache hit?  ────────────────────┤ (return instantly ✅)
+     │                                                │                                  │
+     │                                                └─ cache miss?                     │
+     │                                                     │                             │
+     ├─ 2. Returns status: "fetch_required" ◄──────────────┘                             │
+     │     (Includes raw target URL, method, payload)                                    │
+     │                                                                                   │
+     │  3. Client executes HTTP directly ───────────────────────────────────────────────►│
+     │     (using cellular/trusted IP)                                                   │
+     │                                                                                   │
+     │  4. Client receives raw JSON/HTML ◄───────────────────────────────────────────────┘
+     │                                                                                   │
+     ├─ 5. POST /relay/callback (raw response) ──────►│                                  │
+     │                                                ├─ parses & validates              │
+     │                                                ├─ saves to PostgreSQL mirror      │
+     │                                                │                                  │
+     ├─ 6. Enriched clean JSON response ◄─────────────┘                                  │
+     │                                                                                   │
+     └─ 7. Subsequent requests hit cache → instant response, zero phone involvement ✅
+```
+
+### Relay Protocol Flow
+
+1. **Client Header**: The client sends `X-Client-Relay: true` on requests.
+2. **Cache Hit**: If data is already fresh in the PostgreSQL mirror, the server returns the clean JSON immediately (e.g. `200 OK` with `{ "date": "...", "entries": [...] }`).
+3. **Cache Miss (`fetch_required`)**: When upstream fetching is needed, the server returns:
+   ```json
+   {
+     "status": "fetch_required",
+     "task": {
+       "task_id": "tt_2026-09-17_2026-09-17_wdefault_a1b2c3",
+       "action": "timetable",
+       "url": "https://krmu.icloudems.com/corecampus/admin/schedulerand/ctrl_tt_report_emp_rum.php",
+       "method": "POST",
+       "headers": {
+         "Authorization": "eyJ...",
+         "Referer": "corecampus/admin/schedulerand/ctrl_tt_report_emp_rum.php"
+       },
+       "json": {
+         "action": "wdefault",
+         "attendanceFlag": 1,
+         "client": "KRMU",
+         "empid": "21828",
+         "startDate": "2026-09-14",
+         "endDate": "2026-09-20",
+         "from": "app",
+         "method": "getData",
+         "br_id": 4
+       },
+       "meta": { "date": "2026-09-17" }
+     }
+   }
+   ```
+4. **Client Direct Fetch**: The client sends the HTTP request directly to iCloudEMS using `axios` or standard HTTP from the device.
+5. **Relay Ingest Callback**: The client POSTs the raw response back to the server:
+   ```http
+   POST /sessions/{session_id}/relay/callback
+   Content-Type: application/json
+   ```
+   ```json
+   {
+     "task_id": "tt_2026-09-17_2026-09-17_wdefault_a1b2c3",
+     "task_type": "timetable",
+     "raw_data": { "...raw upstream response json..." },
+     "meta": { "date": "2026-09-17" }
+   }
+   ```
+6. **Enriched Response**: The server validates the raw response, saves it to the PostgreSQL database mirror, and returns the final parsed model.
+7. **Transparent Mobile Integration**: In `Projexa-AI-Mobile/src/api/icloudClient.js`, `handleRelayResponse` executes this transparently in the background, so UI screens receive standard resolved data without manual task plumbing.
 
 ## Base URL
+
 
 ```text
 http://127.0.0.1:8000
@@ -191,6 +273,12 @@ A successful response means required configuration is present. A deployment shou
 GET /sessions/{session_id}/timetable?date=2026-09-16
 ```
 
+Optional force refresh (bypasses TTL cache and issues a live upstream relay task):
+
+```http
+GET /sessions/{session_id}/timetable?date=2026-09-16&force=true
+```
+
 Response:
 
 ```json
@@ -210,6 +298,13 @@ Response:
 }
 ```
 
+### Cache & TTL Rules
+
+- **Today's Classes (`today`)**: Default TTL is 15 minutes (`ROSTER_CACHE_TTL_TODAY_SECONDS=900`).
+- **Recent Classes (within 7 days)**: Default TTL is 1 hour (`ROSTER_CACHE_TTL_RECENT_SECONDS=3600`).
+- **Historical Classes (> 7 days)**: Default TTL is 24 hours (`ROSTER_CACHE_TTL_SECONDS=86400`).
+- **Hard Refresh**: Passing `force=true` (or pressing "Refresh" in the client) immediately bypasses the cache, issues a live upstream relay task to fetch from iCloudEMS, updates PostgreSQL, and returns fresh data.
+
 Treat timetable entries as extensible objects. iCloudEMS changes and adds fields over time. Do not reject unknown fields.
 
 ### Important weekly provider behavior
@@ -219,6 +314,7 @@ The provider does **not** support arbitrary wide date ranges in one timetable re
 The platform should send normal calendar dates to this API. It must not attempt to construct provider weekly actions or call provider endpoints directly.
 
 If the provider circuit breaker returns `503`, continue showing cached data and retry later.
+
 
 ## Roster
 

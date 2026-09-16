@@ -18,7 +18,7 @@ token_store = create_token_store()
 
 
 @router.post("", response_model=StartLoginResponse)
-def start_login(req: StartLoginRequest):
+def start_login(request: Request, req: StartLoginRequest):
     sid, client = store.create()
     store.set_email(sid, req.email)
     client.contact = req.email
@@ -41,16 +41,20 @@ def start_login(req: StartLoginRequest):
                 email=req.email, empid=client.empid,
             )
         except Exception:
-            # Keep device_id so the server still recognizes us.
             client.clear_session(keep_device_id=True)
 
-    data = client.send_otp(req.email)
-    if data.get("status") != "success":
-        raise HTTPException(400, detail=f"OTP send failed: {data}")
-    return StartLoginResponse(
-        session_id=sid, state="otp_sent",
-        email=req.email, empid=None,
-    )
+    try:
+        data = client.send_otp(req.email)
+        if data.get("status") != "success":
+            raise HTTPException(400, detail=f"OTP send failed: {data}")
+        return StartLoginResponse(
+            session_id=sid, state="otp_sent",
+            email=req.email, empid=None,
+        )
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(502, detail=f"iCloudEMS auth unavailable: {exc}")
 
 
 @router.post("/token", response_model=StartLoginResponse)
@@ -117,14 +121,19 @@ def request_link_otp(request: Request):
         except Exception:
             client.clear_session(keep_device_id=True)
 
-    # No valid stored tokens — fall back to OTP
-    data = client.send_otp(email)
-    if data.get("status") != "success":
+    try:
+        data = client.send_otp(email)
+        if data.get("status") != "success":
+            store.delete(sid)
+            raise HTTPException(400, detail="iCloudEMS OTP request failed")
+        return StartLoginResponse(
+            session_id=sid, state="otp_sent", email=email, empid=None,
+        )
+    except HTTPException:
+        raise
+    except Exception as exc:
         store.delete(sid)
-        raise HTTPException(400, detail="iCloudEMS OTP request failed")
-    return StartLoginResponse(
-        session_id=sid, state="otp_sent", email=email, empid=None,
-    )
+        raise HTTPException(502, detail=f"iCloudEMS auth unavailable: {exc}")
 
 
 @router.post("/{sid}/verify", response_model=VerifyOtpResponse)
@@ -133,16 +142,21 @@ def verify(sid: str, req: VerifyOtpRequest):
     if not client:
         raise HTTPException(404, "session not found")
 
-    data = client.validate_otp(req.otp)
-    if not client.access_token:
-        msg = ((data.get("data") or {}).get("message")
-               or data.get("message") or "invalid OTP")
-        raise HTTPException(400, detail=msg)
+    try:
+        data = client.validate_otp(req.otp)
+        if not client.access_token:
+            msg = ((data.get("data") or {}).get("message")
+                   or data.get("message") or "invalid OTP")
+            raise HTTPException(400, detail=msg)
 
-    client.save_to_store(token_store, client.contact)
-    return VerifyOtpResponse(
-        session_id=sid, email=client.contact, empid=client.empid,
-    )
+        client.save_to_store(token_store, client.contact)
+        return VerifyOtpResponse(
+            session_id=sid, email=client.contact or "", empid=client.empid,
+        )
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(502, detail=f"iCloudEMS verify unavailable: {exc}")
 
 
 @router.post("/{sid}/refresh", response_model=RefreshResponse)

@@ -428,10 +428,15 @@ def _run_load_job_thread(jid: str, client: ICloudEMSClient,
 
 @router.post("/{sid}/courses/load", response_model=CoursesLoadResponse)
 def load_courses(sid: str, req: CoursesLoadRequest):
+    """Return cached course data from the mirror.
+
+    The server cannot fetch from iCloudEMS directly — data must be
+    populated by the mobile app via timetable/roster proxy endpoints.
+    """
     client = get_client(sid)
     date_from = req.date_from.isoformat()
     date_to = req.date_to.isoformat()
-    if mirror is not None and not req.force:
+    if mirror is not None:
         try:
             if mirror.has_fresh_sync(client.empid, date_from, date_to):
                 cached = mirror.cached_course_result(client.empid, date_from, date_to)
@@ -441,18 +446,12 @@ def load_courses(sid: str, req: CoursesLoadRequest):
                                 progress={"phase": "cached", "done": 1, "total": 1})
                     return CoursesLoadResponse(job_id=jid)
         except Exception as ex:
-            _log(f"[courses] cache read failed; falling back to sync: {ex!r}")
-    try:
-        jid = jobs.create(owner_sid=sid)
-    except RuntimeError as ex:
-        raise HTTPException(429, str(ex)) from ex
-    threading.Thread(
-        target=_run_load_job_thread,
-          args=(jid, client, date_from, date_to, req.force, req.subject_id,
-              req.sync_day.isoformat() if req.sync_day else None, req.slot_keys),
-        daemon=True,
-    ).start()
-    return CoursesLoadResponse(job_id=jid)
+            _log(f"[courses] cache read failed: {ex!r}")
+    raise HTTPException(
+        409,
+        "No cached course data available. "
+        "Please sync timetable and rosters from the mobile app first.",
+    )
 
 
 @router.get("/{sid}/jobs/{jid}")

@@ -1,43 +1,53 @@
+"""Timetable routes — always returns proxy instructions to the mobile app."""
+from typing import Any, Dict, Union
 from fastapi import APIRouter, HTTPException, Query
 
+from ..config import (
+    ROSTER_CACHE_TTL_SECONDS, ROSTER_CACHE_TTL_TODAY_SECONDS, ROSTER_CACHE_TTL_RECENT_SECONDS,
+)
 from ..icloudems import extract_entries_for_date
-from ..icloudems.http import HTTPError
-from ..config import PROVIDER_COOLDOWN_SECONDS, PROVIDER_FAILURE_THRESHOLD
 from ..logging_utils import _log
-from ..runtime_state import runtime_state
-from ..schemas import TimetableResponse
+from ..mirror import mirror
+from ..storage import create_token_store
 from . import get_client
+from datetime import date as dt_date
 
 router = APIRouter()
+token_store = create_token_store()
 
 
-@router.get("/{sid}/timetable", response_model=TimetableResponse)
-def timetable(sid: str, date: str = Query(...)):
+@router.get("/{sid}/timetable")
+def timetable(sid: str, date: str = Query(...), force: bool = Query(False)) -> Dict[str, Any]:
+    """Return proxy instruction for the mobile app to fetch timetable.
+
+    The mobile app executes this against iCloudEMS using its own IP,
+    then posts the raw response to /proxy/ingest.
+    """
     client = get_client(sid)
-    provider_key = "timetable"
-    if not runtime_state.provider_available(
-        provider_key, PROVIDER_FAILURE_THRESHOLD, PROVIDER_COOLDOWN_SECONDS,
-    ):
-        _log(f"[timetable] circuit breaker open for {provider_key}")
-        raise HTTPException(503, "timetable provider temporarily unavailable; use cached data")
-    try:
-        _log(f"[timetable] fetching for empid={client.empid} date={date}")
-        data = client._with_auto_refresh(
-            client.get_timetable, client.empid, date, date,
-        )
-        runtime_state.record_provider_success(provider_key)
-        _log(f"[timetable] success for date={date}")
-    except HTTPError as exc:
-        runtime_state.record_provider_failure(provider_key)
-        _log(f"[timetable] HTTPError status={exc.status} reason={exc.reason} url={exc.url} body={exc.body[:500] if exc.body else '(empty)'}")
-        if exc.status == 401:
-            raise HTTPException(401, "session expired; please sign in again") from exc
-        raise HTTPException(502, f"timetable provider error: {exc.status} {exc.reason}") from exc
-    except ValueError as exc:
-        _log(f"[timetable] ValueError: {exc}")
-        raise HTTPException(400, "invalid timetable date") from exc
-    except Exception as exc:
-        _log(f"[timetable] unexpected error: {type(exc).__name__}: {exc}")
-        raise
-    entries = extract_entries_for_date(data, date)
-    return TimetableResponse(date=date, entries=entries)
+    empid = client.empid
+
+    # 1. Check mirror cache first (no proxy needed if cached)
+    if mirror is not None and empid and not force:
+        try:
+            today = dt_date.today()
+            target_dt = dt_date.fromisoformat(date)
+            if target_dt == today:
+                ttl = ROSTER_CACHE_TTL_TODAY_SECONDS
+            elif (today - target_dt).days <= 7:
+                ttl = ROSTER_CACHE_TTL_RECENT_SECONDS
+            else:
+                ttl = ROSTER_CACHE_TTL_SECONDS
+        except Exception:
+            ttl = ROSTER_CACHE_TTL_TODAY_SECONDS
+        cached_entries = mirror.get_timetable(empid, date, date, max_age_seconds=ttl)
+        if cached_entries is not None:
+            _log(f"[timetable] CACHE HIT for empid={empid} date={date} ({len(cached_entries)} entries)")
+            return {"date": date, "entries": cached_entries}
+
+    # 2. Return proxy instruction — mobile fetches from iCloudEMS
+    tasks = client.build_proxy_timetable_tasks(empid, date, date)
+    task = tasks[0] if tasks else client.build_proxy_timetable(empid, date, date)
+    task["meta"] = {"route": "timetable", "date": date}
+    task["proxy_required"] = True
+    _log(f"[timetable] proxy instruction for empid={empid} date={date}")
+    return task

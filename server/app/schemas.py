@@ -86,6 +86,8 @@ class RosterRequest(StrictModel):
     day_entries: List[Dict[str, Any]] = Field(
         min_length=1, max_length=MAX_DAY_ENTRIES
     )
+    force: bool = False
+
 
 
 class RosterResponse(StrictModel):
@@ -210,4 +212,30 @@ class BatchSlotUpdateRequest(StrictModel):
 
 class BatchSlotUpdateResponse(StrictModel):
     results: List[SlotUpdateResult]
+
+
+# ---------------------------------------------------------------------------
+# Mobile-as-Proxy schemas
+# ---------------------------------------------------------------------------
+
+class ProxyInstruction(BaseModel):
+    """What the server returns to the mobile app — tells it what to fetch."""
+    proxy_required: bool = True
+    method: str                        # "GET" | "POST" | "POST_MULTIPART"
+    url: str
+    headers: Dict[str, str] = Field(default_factory=dict)
+    json_body: Optional[Dict[str, Any]] = None
+    form_data: Optional[Dict[str, str]] = None
+    meta: Optional[Dict[str, Any]] = None
+
+    model_config = ConfigDict(extra="forbid")
+
+
+class ProxyIngestRequest(BaseModel):
+    """What the mobile app sends back after executing the request."""
+    route: str                         # "timetable" | "roster" | "submit"
+    status_code: int
+    body: Any
+    meta: Optional[Dict[str, Any]] = None
+
 

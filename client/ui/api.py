@@ -61,7 +61,64 @@ class ServerClient:
         raise ServerError(r.status_code, msg, detail, request_id, code)
 
     def _headers(self):
-        return {"X-Request-ID": uuid.uuid4().hex}
+        return {
+            "X-Request-ID": uuid.uuid4().hex,
+            "X-Client-Relay": "true",
+        }
+
+    def _execute_task(self, task):
+        method = task.get("method", "POST").upper()
+        url = task["url"]
+        headers = task.get("headers", {})
+        json_data = task.get("json") or task.get("json_data")
+        form_data = task.get("form_data")
+
+        req_headers = {**headers}
+        if "User-Agent" not in req_headers:
+            req_headers["User-Agent"] = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
+
+        if method == "POST_MULTIPART" or form_data:
+            files_dict = {}
+            for k, v in form_data.items():
+                files_dict[k] = (None, v)
+            resp = requests.post(url, files=files_dict, headers=req_headers, timeout=60)
+        elif method == "POST":
+            resp = requests.post(url, json=json_data, headers=req_headers, timeout=60)
+        else:
+            resp = requests.get(url, headers=req_headers, timeout=60)
+
+        raw_data = None
+        try:
+            raw_data = resp.json()
+        except Exception:
+            raw_data = resp.text
+        return raw_data
+
+    def _handle_relay_response(self, data):
+        if isinstance(data, dict) and data.get("status") == "fetch_required":
+            task = data.get("task")
+            tasks = data.get("tasks")
+            if task:
+                raw_data = self._execute_task(task)
+                callback_payload = {
+                    "task_id": task.get("task_id"),
+                    "task_type": task.get("action"),
+                    "raw_data": raw_data,
+                    "meta": task.get("meta") or {"date": data.get("date")},
+                }
+                return self._post(f"/sessions/{self.session_id}/relay/callback", callback_payload)
+            elif tasks:
+                responses = []
+                for t in tasks:
+                    raw = self._execute_task(t)
+                    responses.append({"task_id": t.get("task_id"), "data": raw})
+                callback_payload = {
+                    "task_type": tasks[0].get("action", "timetable"),
+                    "date": data.get("date"),
+                    "responses": responses,
+                }
+                return self._post(f"/sessions/{self.session_id}/timetable/ingest", callback_payload)
+        return data
 
     def _post(self, path, json=None, timeout=120):
         try:
@@ -73,7 +130,10 @@ class ServerClient:
             )
         except requests.RequestException as e:
             raise ServerError(0, f"transport error: {e}")
-        return self._check(r)
+        data = self._check(r)
+        if "/relay/" not in path and "/ingest" not in path:
+            return self._handle_relay_response(data)
+        return data
 
     def _get(self, path, params=None, timeout=60):
         try:
@@ -85,7 +145,9 @@ class ServerClient:
             )
         except requests.RequestException as e:
             raise ServerError(0, f"transport error: {e}")
-        return self._check(r)
+        data = self._check(r)
+        return self._handle_relay_response(data)
+
 
     def health(self):
         return self._get("/health/ready", timeout=10)
@@ -132,16 +194,17 @@ class ServerClient:
 
     # ---------- by-date flow (existing) ----------
 
-    def timetable(self, date):
+    def timetable(self, date, force=False):
         return self._get(
-            f"/sessions/{self.session_id}/timetable", {"date": date}
+            f"/sessions/{self.session_id}/timetable", {"date": date, "force": force}
         )
 
-    def roster(self, entry, day_entries):
+    def roster(self, entry, day_entries, force=False):
         return self._post(
             f"/sessions/{self.session_id}/roster",
-            {"entry": entry, "day_entries": day_entries},
+            {"entry": entry, "day_entries": day_entries, "force": force},
         )
+
 
     def submit(self, entry, all_admno, present_admno,
                update_id, academicyear, idempotency_key, force=False):

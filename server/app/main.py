@@ -9,7 +9,7 @@ from uuid import uuid4
 
 from .config import DATABASE_URL, ENVIRONMENT, MAX_REQUESTS_PER_MINUTE, REDIS_URL
 from .logging_utils import _log
-from .routes import auth, timetable, attendance, courses
+from .routes import auth, timetable, attendance, courses, proxy
 from .runtime_state import runtime_state
 from .projexa_auth import projexa_auth_middleware
 
@@ -20,6 +20,8 @@ app.include_router(auth.router,       prefix="/sessions", tags=["auth"])
 app.include_router(timetable.router,  prefix="/sessions", tags=["timetable"])
 app.include_router(attendance.router, prefix="/sessions", tags=["attendance"])
 app.include_router(courses.router,    prefix="/sessions", tags=["courses"])
+app.include_router(proxy.router,      prefix="/sessions", tags=["proxy"])
+
 
 
 @app.get("/health")

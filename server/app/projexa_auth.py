@@ -46,8 +46,20 @@ async def projexa_auth_middleware(request: Request, call_next):
         return JSONResponse(status_code=exc.status_code, content={"detail": exc.detail})
     match = re.match(r"^/sessions/([^/]+)", request.url.path)
     if match:
-        from .sessions import store
-        subject = request.state.projexa_user["sub"]
-        if not store.owns_identity(match.group(1), subject):
-            return JSONResponse(status_code=403, content={"detail": "session does not belong to Projexa user"})
+        sid = match.group(1)
+        if sid not in {"token", "link"}:
+            from .sessions import store
+            subject = str(request.state.projexa_user.get("sub", ""))
+            email = (request.state.projexa_user.get("email") or "").strip().lower()
+
+            if not store.get(sid):
+                return JSONResponse(status_code=401, content={"detail": "session expired or invalid; please re-authenticate"})
+
+            if not store.owns_identity(sid, subject):
+                # If subject doesn't match but email does (e.g. id vs email in sub), claim ownership
+                session_email = (store.get_email(sid) or "").strip().lower()
+                if session_email and session_email == email:
+                    store.set_identity(sid, subject)
+                else:
+                    return JSONResponse(status_code=403, content={"detail": "session does not belong to Projexa user"})
     return await call_next(request)
