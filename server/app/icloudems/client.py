@@ -1,18 +1,24 @@
 """ICloudEMS HTTP client. See quirks.md for the rules this encodes."""
+import asyncio
 import base64
 import json
 import re
+import threading
 import time
 import uuid
 
 from ..config import ROSTER_DUMP, SUBMIT_DUMP
 from ..logging_utils import _log, _dump_json
-from .http import HTTPError, HttpResponse, HttpSession
+from .http import HTTPError, HttpResponse, HttpSession, AsyncHttpSession
 
 try:
     import requests as _plain_requests
 except ImportError:
     _plain_requests = None
+
+# Shared lock for token refresh — prevents multiple clones from
+# doing redundant refreshes that overwrite each other's tokens.
+_refresh_lock = threading.Lock()
 
 
 class ICloudEMSClient:
@@ -36,6 +42,14 @@ class ICloudEMSClient:
     def __init__(self, debug=True):
         self.session = HttpSession()
         self.session.update_headers({
+            "User-Agent": self.USER_AGENT,
+            "Accept": "application/json",
+            "Accept-Encoding": "gzip, deflate, br",
+            "Content-Type": "application/json",
+        })
+
+        self.async_session = AsyncHttpSession()
+        self.async_session.update_headers({
             "User-Agent": self.USER_AGENT,
             "Accept": "application/json",
             "Accept-Encoding": "gzip, deflate, br",
@@ -486,7 +500,8 @@ class ICloudEMSClient:
             if e.status != 401:
                 raise
             self._log("got 401, attempting refresh…")
-            self.refresh()
+            with _refresh_lock:
+                self.refresh()
             return fn(*args, **kwargs)
 
     def clone(self):
@@ -505,5 +520,169 @@ class ICloudEMSClient:
         c.username = self.username
         c.contact = self.contact
         c.empid = self.empid
-        c._warmed = False
+        c._warmed = self._warmed  # inherit warmup state
         return c
+
+    # ---------- async methods ----------
+
+    async def warmup_async(self):
+        if self._warmed:
+            return
+        try:
+            r = await self.async_session.get(self.KRMU_HOST + "/", timeout=15)
+            self._log("async GET krmu / ->", r.status_code)
+        except Exception as e:
+            self._log("async warmup failed:", e)
+        if self.plain_session is not None:
+            try:
+                for k, v in self.async_session.cookies_dict().items():
+                    self.plain_session.cookies.set(k, v)
+            except Exception:
+                pass
+        self._warmed = True
+
+    async def get_timetable_week_async(self, empid, start_date, end_date, action="wdefault"):
+        await self.warmup_async()
+        r = await self.async_session.post(
+            f"{self.KRMU_HOST}/corecampus/admin/schedulerand/"
+            f"ctrl_tt_report_emp_rum.php",
+            json={
+                "action": action,
+                "attendanceFlag": 1,
+                "client": self.CLIENT,
+                "empid": str(empid),
+                "endDate": end_date,
+                "from": "app",
+                "method": "getData",
+                "room": "",
+                "startDate": start_date,
+                "br_id": self.BR_ID,
+            },
+            headers=self._auth_headers(
+                referer="corecampus/admin/schedulerand/"
+                        "ctrl_tt_report_emp_rum.php"),
+            timeout=60,
+        )
+        self._log(f"async POST ctrl_tt_report ({action} {start_date}..{end_date}) ->", r.status_code)
+        r.raise_for_status()
+        return r.json()
+
+    async def get_timetable_async(self, empid, start_date, end_date):
+        """Fetch timetable by calculating all week boundaries upfront,
+        then firing all POST requests simultaneously."""
+        from datetime import datetime, timedelta
+
+        dt_start = datetime.strptime(start_date, "%Y-%m-%d")
+        dt_end = datetime.strptime(end_date, "%Y-%m-%d")
+
+        # Calculate all Monday-Sunday week boundaries that cover the range
+        weeks = []
+        current_monday = dt_start - timedelta(days=dt_start.weekday())
+        end_sunday = dt_end + timedelta(days=(6 - dt_end.weekday()))
+
+        while current_monday <= end_sunday:
+            week_sunday = current_monday + timedelta(days=6)
+            weeks.append((
+                current_monday.strftime("%Y-%m-%d"),
+                week_sunday.strftime("%Y-%m-%d"),
+            ))
+            current_monday += timedelta(days=7)
+
+        if not weeks:
+            return {"emp_timetable": {"": [], "NEWTT": {}, "StartDate": start_date, "EndDate": end_date}, "status": "success"}
+
+        # Determine current week's Monday to decide which action to use
+        today = datetime.now()
+        current_week_monday = (today - timedelta(days=today.weekday())).strftime("%Y-%m-%d")
+
+        self._log(f"[async timetable] fetching {len(weeks)} weeks in parallel for {start_date}..{end_date}")
+
+        # Fire all week requests simultaneously.
+        # 'previous' shifts back one week from given dates, so to get
+        # week [mon, sun] we must send previous with [mon+7, sun+7].
+        # 'wdefault' returns the exact week given.
+        tasks = []
+        for mon, sun in weeks:
+            if mon < current_week_monday:
+                # Send next week's dates so previous goes back to the right week
+                next_mon = (datetime.strptime(mon, "%Y-%m-%d") + timedelta(days=7)).strftime("%Y-%m-%d")
+                next_sun = (datetime.strptime(sun, "%Y-%m-%d") + timedelta(days=7)).strftime("%Y-%m-%d")
+                tasks.append(self.get_timetable_week_async(empid, next_mon, next_sun, action="previous"))
+            else:
+                tasks.append(self.get_timetable_week_async(empid, mon, sun, action="wdefault"))
+
+        weekly_responses = list(await asyncio.gather(*tasks))
+
+        # Merge all weekly responses
+        merged_emp_tt = {
+            "": [],
+            "NEWTT": {},
+            "StartDate": start_date,
+            "EndDate": end_date,
+        }
+        for resp in weekly_responses:
+            emp_tt = resp.get("emp_timetable", {}) or {}
+            flat = emp_tt.get("", [])
+            if isinstance(flat, list):
+                merged_emp_tt[""].extend(flat)
+            newtt = emp_tt.get("NEWTT", {}) or {}
+            if isinstance(newtt, dict):
+                for day, by_from in newtt.items():
+                    if not isinstance(by_from, dict):
+                        continue
+                    day_dict = merged_emp_tt["NEWTT"].setdefault(day, {})
+                    for ft, by_to in by_from.items():
+                        if not isinstance(by_to, dict):
+                            continue
+                        ft_dict = day_dict.setdefault(ft, {})
+                        for tt, entries in by_to.items():
+                            if not isinstance(entries, list):
+                                continue
+                            ft_dict.setdefault(tt, []).extend(entries)
+
+        return {"emp_timetable": merged_emp_tt, "status": "success"}
+
+    async def get_attendance_default_async(self, empid, entry, tt_array_data):
+        r = await self.async_session.post(
+            f"{self.KRMU_HOST}/corecampus/admin/attendance/"
+            f"ctrl_attendanceTaken.php",
+            json={
+                "from": "app",
+                "method": "getAttendanceDefault",
+                "classid": str(entry.get("classid") or entry.get("classId")),
+                "fromtime": entry.get("fromTime"),
+                "totime": entry.get("toTime"),
+                "date": entry.get("fromDate"),
+                "division": entry.get("division"),
+                "subjectId": str(entry.get("subjectId")),
+                "batchId": str(entry.get("batchGroupId") or entry.get("batch")),
+                "ttArrayData": tt_array_data,
+                "containerId": str(entry.get("containerId", "0")),
+                "empid": str(empid),
+                "br_id": self.BR_ID,
+                "client": self.CLIENT,
+                "attendTakenFlag": 1,
+            },
+            headers=self._auth_headers(
+                referer="corecampus/admin/attendance/"
+                        "ctrl_attendanceTaken.php"),
+            timeout=60,
+        )
+        self._log("async POST ctrl_attendanceTaken ->", r.status_code)
+        r.raise_for_status()
+        try:
+            _dump_json(r.json(), ROSTER_DUMP)
+        except Exception:
+            pass
+        return r
+
+    async def _with_auto_refresh_async(self, fn, *args, **kwargs):
+        try:
+            return await fn(*args, **kwargs)
+        except HTTPError as e:
+            if e.status != 401:
+                raise
+            self._log("got 401, attempting refresh…")
+            with _refresh_lock:
+                self.refresh()
+            return await fn(*args, **kwargs)

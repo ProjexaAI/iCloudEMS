@@ -18,6 +18,7 @@ Design notes
 - The `absent_rollno` inversion lives in ICloudEMSClient.submit_attendance
   and never escapes it. This route speaks in `present_admno`.
 """
+import asyncio
 import concurrent.futures
 import threading
 from fastapi import APIRouter, HTTPException
@@ -44,6 +45,9 @@ router = APIRouter()
 
 DEFAULT_ACADEMIC_YEAR = "2026-2027"
 
+# Global async semaphore: caps concurrent iCloudEMS API calls.
+_api_semaphore = asyncio.Semaphore(ROSTER_FETCH_CONCURRENCY)
+
 
 # ---------- helpers ----------
 
@@ -69,18 +73,7 @@ def _course_key(e: dict) -> str:
 
 
 def _extract_all_entries(timetable_json: dict) -> list:
-    """Return every entry the timetable contains, deduped by (slot, course).
-
-    IMPORTANT — this was the bug:
-    For a wide date range the server returns entries BOTH under
-    emp_timetable[""] AND under emp_timetable["NEWTT"][<day>][<from>][<to>].
-    The old code used NEWTT only if "" was empty — so once "" had
-    anything in it, everything under NEWTT was ignored, and the course
-    list came back incomplete.
-
-    We now merge both sources, dedupe by (slot_key, course_key), log how
-    many came from each, and dump the raw response for diagnosis.
-    """
+    """Return every entry the timetable contains, deduped by (slot, course)."""
     from pathlib import Path as _P
     from ..logging_utils import _dump_json
 
@@ -121,8 +114,26 @@ def _extract_all_entries(timetable_json: dict) -> list:
     _log(f"[courses] after merge+dedupe: {len(out)} unique (slot, course) pairs")
     return out
 
+
+async def _fetch_slot_async(client: ICloudEMSClient, entry: dict, day_entries: list):
+    """Fetch and parse one slot's roster using async I/O."""
+    tt_array = build_tt_array_data(day_entries)
+    async with _api_semaphore:
+        resp = await client._with_auto_refresh_async(
+            client.get_attendance_default_async, client.empid, entry, tt_array,
+        )
+    students, update_id, taken_flag = parse_roster(resp)
+    uid = None if update_id in (None, "", 0) else str(update_id)
+    return {
+        "taken": taken_flag,
+        "update_id": uid,
+        "present": {s["admno"] for s in students if s["present"]},
+        "students": students,
+    }
+
+
 def _fetch_slot(client: ICloudEMSClient, entry: dict, day_entries: list):
-    """Fetch and parse one slot's roster. Returns a normalized dict."""
+    """Fetch and parse one slot's roster (sync fallback)."""
     tt_array = build_tt_array_data(day_entries)
     resp = client._with_auto_refresh(
         client.get_attendance_default, client.empid, entry, tt_array,
@@ -139,12 +150,13 @@ def _fetch_slot(client: ICloudEMSClient, entry: dict, day_entries: list):
 
 # ---------- background job ----------
 
-def _run_load_job(jid: str, client: ICloudEMSClient,
-                  date_from: str, date_to: str) -> None:
+async def _run_load_job_async(jid: str, client: ICloudEMSClient,
+                              date_from: str, date_to: str) -> None:
+    """Async version: timetable fetched via sync paging, rosters parallelized."""
     try:
         jobs.update(jid, progress={"phase": "timetable", "done": 0, "total": 1})
-        tt = client._with_auto_refresh(
-            client.get_timetable, client.empid, date_from, date_to,
+        tt = await client._with_auto_refresh_async(
+            client.get_timetable_async, client.empid, date_from, date_to,
         )
         raw_entries = _extract_all_entries(tt)
         all_entries = [
@@ -153,7 +165,6 @@ def _run_load_job(jid: str, client: ICloudEMSClient,
         ]
         _log(f"[courses] timetable returned {len(raw_entries)} entries, {len(all_entries)} within {date_from}..{date_to}")
 
-        # Group entries by course and by date.
         courses_by_key = {}
         for e in all_entries:
             ck = _course_key(e)
@@ -177,19 +188,20 @@ def _run_load_job(jid: str, client: ICloudEMSClient,
         total = len(all_entries)
         jobs.update(jid, progress={"phase": "rosters", "done": 0, "total": total})
 
-        # Fetch each slot's roster concurrently. Each worker thread uses its
-        # own client.clone() for thread-safe HTTP sessions.
+        # Fetch ALL rosters concurrently with asyncio.gather — this is
+        # the key speed improvement over threading. All N requests fire
+        # simultaneously with true async I/O, no GIL, no thread overhead.
         slot_data = {}
         completed = 0
-        lock = threading.Lock()
+        progress_lock = asyncio.Lock()
 
-        def _fetch_one_slot(e):
+        async def _fetch_one(e):
             nonlocal completed
             sk = _slot_key(e)
             day_entries = by_date.get(e.get("fromDate"), [])
             worker_client = client.clone()
             try:
-                data = _fetch_slot(worker_client, e, day_entries)
+                data = await _fetch_slot_async(worker_client, e, day_entries)
             except Exception as ex:
                 _log(f"[courses] slot fetch failed {sk}: {ex!r}")
                 data = {
@@ -197,24 +209,21 @@ def _run_load_job(jid: str, client: ICloudEMSClient,
                     "present": set(), "students": [],
                     "error": str(ex),
                 }
-            with lock:
+            async with progress_lock:
                 slot_data[sk] = data
                 completed += 1
                 jobs.update(jid, progress={
                     "phase": "rosters", "done": completed, "total": total,
                 })
 
-        workers = max(1, min(ROSTER_FETCH_CONCURRENCY, total or 1))
-        _log(f"[courses] fetching {total} slot rosters with {workers} concurrent workers...")
-        with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as executor:
-            list(executor.map(_fetch_one_slot, all_entries))
+        _log(f"[courses] fetching {total} slot rosters with asyncio.gather (max {_api_semaphore._value} concurrent)...")
+        await asyncio.gather(*[_fetch_one(e) for e in all_entries])
 
         # Assemble per-course results.
         result_courses = []
         for ck, cdata in courses_by_key.items():
             entries = cdata["entries"]
 
-            # Union of students across every slot of this course.
             students_map = {}
             for e in entries:
                 sd = slot_data.get(_slot_key(e))
@@ -223,10 +232,6 @@ def _run_load_job(jid: str, client: ICloudEMSClient,
                 for s in sd["students"]:
                     students_map[s["admno"]] = s
 
-            # Matrix: only include (student, slot) pairs where the
-            # student was actually on that slot's roster. This is
-            # important: a student who joined mid-semester must not be
-            # counted as absent for early slots.
             matrix = {admno: {} for admno in students_map}
             for e in entries:
                 sk = _slot_key(e)
@@ -288,6 +293,19 @@ def _run_load_job(jid: str, client: ICloudEMSClient,
         jobs.update(jid, status="error", error=str(ex))
 
 
+def _run_load_job_thread(jid: str, client: ICloudEMSClient,
+                         date_from: str, date_to: str) -> None:
+    """Entry point for background thread: creates an event loop and runs the async job."""
+    loop = asyncio.new_event_loop()
+    try:
+        asyncio.set_event_loop(loop)
+        loop.run_until_complete(
+            _run_load_job_async(jid, client, date_from, date_to)
+        )
+    finally:
+        loop.close()
+
+
 # ---------- routes ----------
 
 @router.post("/{sid}/courses/load", response_model=CoursesLoadResponse)
@@ -295,7 +313,7 @@ def load_courses(sid: str, req: CoursesLoadRequest):
     client = _get_client(sid)
     jid = jobs.create()
     threading.Thread(
-        target=_run_load_job,
+        target=_run_load_job_thread,
         args=(jid, client, req.date_from, req.date_to),
         daemon=True,
     ).start()
@@ -304,7 +322,7 @@ def load_courses(sid: str, req: CoursesLoadRequest):
 
 @router.get("/{sid}/jobs/{jid}")
 def job_status(sid: str, jid: str):
-    _get_client(sid)  # auth check
+    _get_client(sid)
     j = jobs.get(jid)
     if not j:
         raise HTTPException(404, "job not found")
@@ -329,14 +347,7 @@ def slot_state(sid: str, req: SlotStateRequest):
 
 @router.post("/{sid}/slots/toggle", response_model=SlotToggleResponse)
 def toggle_slot(sid: str, req: SlotToggleRequest):
-    """Toggle one student's presence in one slot.
-
-    Flow:
-      1. Re-fetch the slot's current roster (fresh truth).
-      2. Compare current takenAttdId to expected_update_id.
-         - Match  -> apply toggle, submit, re-fetch to grab the new id.
-         - Mismatch -> 409 with the current state so the client can resync.
-    """
+    """Toggle one student's presence in one slot."""
     client = _get_client(sid)
     clone = client.clone()
 
@@ -348,7 +359,6 @@ def toggle_slot(sid: str, req: SlotToggleRequest):
     current_uid = sd["update_id"] or "0"
     expected_uid = req.expected_update_id or "0"
 
-    # Safeguard 1: Disallow toggling individual students on untaken slots
     if not sd["taken"] or current_uid in (None, "0", 0):
         _log(f"[toggle] rejected toggle on untaken slot: {req.student_admno}")
         raise HTTPException(
@@ -357,7 +367,6 @@ def toggle_slot(sid: str, req: SlotToggleRequest):
             "Please take initial attendance for the class from the 'By Date' view first."
         )
 
-    # Safeguard 2: Integrity check on taken slot roster
     if len(sd["students"]) >= 10 and len(sd["present"]) == 0:
         _log(f"[toggle] integrity error: taken slot has 0 present students out of {len(sd['students'])}")
         raise HTTPException(
@@ -374,8 +383,6 @@ def toggle_slot(sid: str, req: SlotToggleRequest):
             "current_present_admno": sorted(sd["present"]),
         })
 
-    # Apply toggle to the FRESH present set, not the client's cached one.
-    # This is the "no cache" guarantee at write time.
     new_present = set(sd["present"])
     if req.present:
         new_present.add(req.student_admno)
@@ -395,7 +402,6 @@ def toggle_slot(sid: str, req: SlotToggleRequest):
         _log(f"[toggle] submit failed: {ex!r}")
         raise HTTPException(502, f"submit failed: {ex}")
 
-    # Re-fetch to get the new takenAttdId for subsequent toggles.
     new_uid = None
     try:
         sd2 = _fetch_slot(clone, req.entry, req.day_entries)
@@ -407,69 +413,55 @@ def toggle_slot(sid: str, req: SlotToggleRequest):
 
 
 @router.post("/{sid}/slots/batch_update", response_model=BatchSlotUpdateResponse)
-def batch_update_slots(sid: str, req: BatchSlotUpdateRequest):
-    """Update multiple lecture slots aggregately and return fresh verified state."""
+async def batch_update_slots(sid: str, req: BatchSlotUpdateRequest):
+    """Update multiple lecture slots concurrently with async I/O."""
     client = _get_client(sid)
-    results = []
 
-    for item in req.updates:
+    async def _process_one(item):
         clone = client.clone()
         sk = _slot_key(item.entry)
         try:
-            # 1. Fetch fresh slot roster
-            sd = _fetch_slot(clone, item.entry, item.day_entries)
+            sd = await _fetch_slot_async(clone, item.entry, item.day_entries)
             current_uid = sd["update_id"] or "0"
             expected_uid = item.expected_update_id or "0"
 
             if not sd["taken"] or current_uid in (None, "0", 0):
-                results.append(SlotUpdateResult(
-                    slot_key=sk,
-                    ok=False,
+                return SlotUpdateResult(
+                    slot_key=sk, ok=False,
                     error="Cannot update an untaken lecture. Please take initial attendance first.",
-                ))
-                continue
+                )
 
             if len(sd["students"]) >= 10 and len(sd["present"]) == 0 and not item.force:
-                results.append(SlotUpdateResult(
-                    slot_key=sk,
-                    ok=False,
+                return SlotUpdateResult(
+                    slot_key=sk, ok=False,
                     error="Integrity check failed: slot reports 0 present students on a large class.",
-                ))
-                continue
+                )
 
             if current_uid != expected_uid:
-                results.append(SlotUpdateResult(
-                    slot_key=sk,
-                    ok=False,
+                return SlotUpdateResult(
+                    slot_key=sk, ok=False,
                     error=f"Conflict: Slot was modified (current updateId={current_uid}, expected={expected_uid}).",
-                ))
-                continue
+                )
 
             all_admno = [s["admno"] for s in sd["students"]]
             academicyear = item.entry.get("acad_year") or DEFAULT_ACADEMIC_YEAR
 
-            # 2. Submit to iCloudEMS
+            # Submit still uses sync (plain_session has no async version)
             clone._with_auto_refresh(
                 clone.submit_attendance,
                 clone.empid, item.entry, all_admno, list(item.present_admno),
                 academicyear, sd["update_id"], force=item.force,
             )
 
-            # 3. Post-submit verification fetch to grab new updateId & verified present roster
-            sd2 = _fetch_slot(clone, item.entry, item.day_entries)
-            results.append(SlotUpdateResult(
-                slot_key=sk,
-                ok=True,
+            sd2 = await _fetch_slot_async(clone, item.entry, item.day_entries)
+            return SlotUpdateResult(
+                slot_key=sk, ok=True,
                 new_update_id=sd2["update_id"],
                 present_admno=sorted(sd2["present"]),
-            ))
+            )
         except Exception as ex:
             _log(f"[batch_update] slot {sk} failed: {ex!r}")
-            results.append(SlotUpdateResult(
-                slot_key=sk,
-                ok=False,
-                error=str(ex),
-            ))
+            return SlotUpdateResult(slot_key=sk, ok=False, error=str(ex))
 
-    return BatchSlotUpdateResponse(results=results)
-
+    results = await asyncio.gather(*[_process_one(item) for item in req.updates])
+    return BatchSlotUpdateResponse(results=list(results))

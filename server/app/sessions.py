@@ -12,7 +12,7 @@ from .icloudems import ICloudEMSClient
 
 class SessionStore:
     def __init__(self):
-        self._lock = threading.Lock()
+        self._lock = threading.RLock()
         self._sessions: Dict[str, dict] = {}
 
     def create(self) -> tuple:
@@ -23,13 +23,11 @@ class SessionStore:
         return sid, client
 
     def get(self, sid: str) -> Optional[ICloudEMSClient]:
-        with self._lock:
-            rec = self._sessions.get(sid)
+        rec = self._sessions.get(sid)
         return rec["client"] if rec else None
 
     def get_email(self, sid: str) -> Optional[str]:
-        with self._lock:
-            rec = self._sessions.get(sid)
+        rec = self._sessions.get(sid)
         return rec["email"] if rec else None
 
     def set_email(self, sid: str, email: str) -> None:

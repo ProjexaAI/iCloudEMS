@@ -117,3 +117,71 @@ class HttpSession:
             return dict(self._s.cookies)
         except Exception:
             return {}
+
+
+class AsyncHttpSession:
+    """Async wrapper using curl_cffi.AsyncSession for non-blocking I/O."""
+
+    def __init__(self):
+        if _HTTP_BACKEND == "curl_cffi":
+            self._s = cffi_requests.AsyncSession(impersonate="chrome")
+        else:
+            self._s = None
+        self._headers = {}
+
+    def update_headers(self, headers):
+        self._headers.update(headers)
+
+    def _wrap(self, raw):
+        text = ""
+        try:
+            text = raw.text
+        except Exception:
+            try:
+                text = raw.content.decode("utf-8", "replace")
+            except Exception:
+                text = ""
+        reason = getattr(raw, "reason", "") or ""
+        return HttpResponse(raw.status_code, reason, text, raw)
+
+    async def post(self, url, json=None, data=None, files=None, headers=None, timeout=30):
+        if self._s is None:
+            raise HTTPError(0, "NoAsyncBackend", "POST", url,
+                            "curl_cffi not installed")
+        merged = dict(self._headers)
+        if headers:
+            merged.update(headers)
+        try:
+            raw = await self._s.post(url, json=json, data=data, files=files,
+                                     headers=merged, timeout=timeout)
+        except Exception as e:
+            raise HTTPError(0, type(e).__name__, "POST", url, str(e))
+        return self._wrap(raw)
+
+    async def get(self, url, headers=None, timeout=15):
+        if self._s is None:
+            raise HTTPError(0, "NoAsyncBackend", "GET", url,
+                            "curl_cffi not installed")
+        merged = dict(self._headers)
+        if headers:
+            merged.update(headers)
+        try:
+            raw = await self._s.get(url, headers=merged, timeout=timeout)
+        except Exception as e:
+            raise HTTPError(0, type(e).__name__, "GET", url, str(e))
+        return self._wrap(raw)
+
+    def cookies_dict(self):
+        if self._s is None:
+            return {}
+        try:
+            return dict(self._s.cookies)
+        except Exception:
+            return {}
+
+    async def close(self):
+        if self._s is not None:
+            try:
+                await self._s.close()
+            except Exception:
+                pass
