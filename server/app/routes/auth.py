@@ -9,10 +9,10 @@ from ..schemas import (
     RefreshResponse,
 )
 from ..sessions import store
-from ..storage import TokenStore
+from ..storage import create_token_store
 
 router = APIRouter()
-token_store = TokenStore()
+token_store = create_token_store()
 
 
 @router.post("", response_model=StartLoginResponse)
@@ -20,6 +20,7 @@ def start_login(req: StartLoginRequest):
     sid, client = store.create()
     store.set_email(sid, req.email)
     client.contact = req.email
+    client._token_store = token_store
 
     restored = client.load_from_store(token_store, req.email)
 

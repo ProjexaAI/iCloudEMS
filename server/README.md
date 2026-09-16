@@ -7,6 +7,12 @@ FastAPI wrapper around the reverse-engineered iCloudEMS client.
     pip install -e .
     ./run.sh
 
+For production, set `ENVIRONMENT=production`, `DATABASE_URL`,
+`REDIS_URL`, and `TOKEN_ENCRYPTION_KEY` before starting. Production mode
+uses PostgreSQL for encrypted provider tokens and Redis for shared runtime
+state; it refuses to start without those dependencies configured. Do not
+use `--reload` in production.
+
 ## Endpoints
 
     POST   /sessions                         {email}
@@ -31,3 +37,11 @@ The client must NEVER see:
 
 If you find yourself editing `app/icloudems/` during integration, stop —
 something leaked.
+
+## Production dependencies
+
+- PostgreSQL stores encrypted provider tokens and durable application data.
+- Redis stores rate limits, distributed locks, idempotency records, and
+  temporary job state.
+- A process supervisor or container orchestrator must restart the API and
+  provide backups, TLS termination, secret injection, and log collection.

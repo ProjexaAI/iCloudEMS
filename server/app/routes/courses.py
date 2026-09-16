@@ -300,10 +300,13 @@ def _run_load_job_thread(jid: str, client: ICloudEMSClient,
 @router.post("/{sid}/courses/load", response_model=CoursesLoadResponse)
 def load_courses(sid: str, req: CoursesLoadRequest):
     client = get_client(sid)
-    jid = jobs.create()
+    try:
+        jid = jobs.create(owner_sid=sid)
+    except RuntimeError as ex:
+        raise HTTPException(429, str(ex)) from ex
     threading.Thread(
         target=_run_load_job_thread,
-        args=(jid, client, req.date_from, req.date_to),
+        args=(jid, client, req.date_from.isoformat(), req.date_to.isoformat()),
         daemon=True,
     ).start()
     return CoursesLoadResponse(job_id=jid)
@@ -312,7 +315,7 @@ def load_courses(sid: str, req: CoursesLoadRequest):
 @router.get("/{sid}/jobs/{jid}")
 def job_status(sid: str, jid: str):
     get_client(sid)
-    j = jobs.get(jid)
+    j = jobs.get(jid, owner_sid=sid)
     if not j:
         raise HTTPException(404, "job not found")
     return j

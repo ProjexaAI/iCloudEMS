@@ -8,4 +8,7 @@ dependencies = [
     "pydantic>=2.5",
     "curl_cffi>=0.5",
     "requests>=2.31",
+    "psycopg[binary]>=3.2",
+    "redis>=5.0",
+    "cryptography>=43.0",
 ]

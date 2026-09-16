@@ -12,6 +12,8 @@ import time
 from typing import Any, Dict, Optional
 from uuid import uuid4
 
+from .config import MAX_JOBS_PER_SESSION
+
 
 class JobRegistry:
     TTL_SECONDS = 3600
@@ -29,11 +31,18 @@ class JobRegistry:
             del self._jobs[k]
             self._progress_done.pop(k, None)
 
-    def create(self) -> str:
+    def create(self, owner_sid: str) -> str:
         jid = uuid4().hex
         with self._lock:
             self._cleanup_locked()
+            active = sum(
+                1 for job in self._jobs.values()
+                if job["owner_sid"] == owner_sid and job["status"] == "running"
+            )
+            if active >= MAX_JOBS_PER_SESSION:
+                raise RuntimeError("maximum active jobs reached for session")
             self._jobs[jid] = {
+                "owner_sid": owner_sid,
                 "created_at": time.time(),
                 "status": "running",
                 "progress": {"phase": "starting", "done": 0, "total": 0},
@@ -53,16 +62,17 @@ class JobRegistry:
                         kwargs["progress"] = dict(p)
                 self._jobs[jid].update(kwargs)
 
-    def get(self, jid: str) -> Optional[Dict[str, Any]]:
-        j = self._jobs.get(jid)
-        if not j:
-            return None
-        return {
-            "status": j["status"],
-            "progress": dict(j["progress"]),
-            "result": j["result"],
-            "error": j["error"],
-        }
+    def get(self, jid: str, owner_sid: str) -> Optional[Dict[str, Any]]:
+        with self._lock:
+            j = self._jobs.get(jid)
+            if not j or j["owner_sid"] != owner_sid:
+                return None
+            return {
+                "status": j["status"],
+                "progress": dict(j["progress"]),
+                "result": j["result"],
+                "error": j["error"],
+            }
 
 
 jobs = JobRegistry()

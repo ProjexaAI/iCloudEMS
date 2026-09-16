@@ -69,6 +69,9 @@ class ICloudEMSClient:
 
         self.access_token = None
         self.refresh_token = None
+        self.access_token_expires_at = None
+        self.refresh_token_expires_at = None
+        self._token_store = None
         self.device_id = self._generate_device_id()
         self.username = None
         self.contact = None
@@ -104,6 +107,14 @@ class ICloudEMSClient:
             return False
         return time.time() < (exp - skew)
 
+    @staticmethod
+    def _token_expiry(token):
+        return ICloudEMSClient.parse_jwt(token or "").get("exp")
+
+    def access_token_needs_refresh(self, skew=300):
+        expiry = self._token_expiry(self.access_token)
+        return not expiry or time.time() >= expiry - skew
+
     def _auth_headers(self, referer=None, use_legacy=False):
         # !!! DO NOT CHANGE TO "Bearer ..." !!!
         h = {}
@@ -130,6 +141,8 @@ class ICloudEMSClient:
         self.empid = rec.get("empid")
         self.access_token = rec.get("access_token")
         self.refresh_token = rec.get("refresh_token")
+        self.access_token_expires_at = self._token_expiry(self.access_token)
+        self.refresh_token_expires_at = self._token_expiry(self.refresh_token)
         if rec.get("device_id"):
             self.device_id = rec["device_id"]
         return True
@@ -141,6 +154,8 @@ class ICloudEMSClient:
             "empid": self.empid,
             "access_token": self.access_token,
             "refresh_token": self.refresh_token,
+            "access_token_expires_at": self._token_expiry(self.access_token),
+            "refresh_token_expires_at": self._token_expiry(self.refresh_token),
             "device_id": self.device_id,
             "saved_at": time.time(),
         })
@@ -205,7 +220,9 @@ class ICloudEMSClient:
         token = (data.get("data") or {}).get("token") or {}
         if token.get("access_token"):
             self.access_token = token["access_token"]
-            self.refresh_token = token["refresh_token"]
+            self.refresh_token = token.get("refresh_token") or self.refresh_token
+            self.access_token_expires_at = self._token_expiry(self.access_token)
+            self.refresh_token_expires_at = self._token_expiry(self.refresh_token)
             claims = self.parse_jwt(self.access_token)
             self.empid = claims.get("admno") or self.empid
         return data
@@ -230,7 +247,9 @@ class ICloudEMSClient:
         token = (data.get("data") or {}).get("token") or {}
         if token.get("access_token"):
             self.access_token = token["access_token"]
-            self.refresh_token = token["refresh_token"]
+            self.refresh_token = token.get("refresh_token") or self.refresh_token
+            self.access_token_expires_at = self._token_expiry(self.access_token)
+            self.refresh_token_expires_at = self._token_expiry(self.refresh_token)
             claims = self.parse_jwt(self.access_token)
             if claims.get("admno"):
                 self.empid = claims["admno"]
@@ -496,6 +515,12 @@ class ICloudEMSClient:
         return r
 
     def _with_auto_refresh(self, fn, *args, **kwargs):
+        if self.access_token_needs_refresh() and self.refresh_token:
+            with _refresh_lock:
+                if self.access_token_needs_refresh():
+                    self.refresh()
+                    if self._token_store and self.contact:
+                        self.save_to_store(self._token_store, self.contact)
         try:
             return fn(*args, **kwargs)
         except HTTPError as e:
@@ -523,6 +548,9 @@ class ICloudEMSClient:
         c = ICloudEMSClient(debug=self.debug)
         c.access_token = self.access_token
         c.refresh_token = self.refresh_token
+        c.access_token_expires_at = self.access_token_expires_at
+        c.refresh_token_expires_at = self.refresh_token_expires_at
+        c._token_store = self._token_store
         c.device_id = self.device_id
         c.username = self.username
         c.contact = self.contact
@@ -685,6 +713,12 @@ class ICloudEMSClient:
         return r
 
     async def _with_auto_refresh_async(self, fn, *args, **kwargs):
+        if self.access_token_needs_refresh() and self.refresh_token:
+            with _refresh_lock:
+                if self.access_token_needs_refresh():
+                    self.refresh()
+                    if self._token_store and self.contact:
+                        self.save_to_store(self._token_store, self.contact)
         try:
             return await fn(*args, **kwargs)
         except HTTPError as e:
