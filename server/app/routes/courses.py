@@ -21,9 +21,10 @@ Design notes
 import asyncio
 import concurrent.futures
 import threading
+from pathlib import Path
 from fastapi import APIRouter, HTTPException
 
-from ..config import ROSTER_FETCH_CONCURRENCY
+from ..config import ROSTER_FETCH_CONCURRENCY, DEFAULT_ACADEMIC_YEAR, DEBUG_MODE
 
 from ..icloudems import (
     ICloudEMSClient,
@@ -31,7 +32,7 @@ from ..icloudems import (
     parse_roster,
 )
 from ..jobs import jobs
-from ..logging_utils import _log
+from ..logging_utils import _log, _dump_json
 from ..schemas import (
     CoursesLoadRequest, CoursesLoadResponse,
     SlotToggleRequest, SlotToggleResponse,
@@ -40,25 +41,15 @@ from ..schemas import (
     BatchSlotUpdateRequest, BatchSlotUpdateResponse,
 )
 from ..sessions import store
+from . import get_client
 
 router = APIRouter()
-
-DEFAULT_ACADEMIC_YEAR = "2026-2027"
 
 # Global async semaphore: caps concurrent iCloudEMS API calls.
 _api_semaphore = asyncio.Semaphore(ROSTER_FETCH_CONCURRENCY)
 
 
 # ---------- helpers ----------
-
-def _get_client(sid: str) -> ICloudEMSClient:
-    c = store.get(sid)
-    if not c:
-        raise HTTPException(404, "session not found")
-    if not c.empid:
-        raise HTTPException(400, "session has no empid (not logged in?)")
-    return c
-
 
 def _slot_key(e: dict) -> str:
     cls = e.get("classid") or e.get("classId") or ""
@@ -74,9 +65,6 @@ def _course_key(e: dict) -> str:
 
 def _extract_all_entries(timetable_json: dict) -> list:
     """Return every entry the timetable contains, deduped by (slot, course)."""
-    from pathlib import Path as _P
-    from ..logging_utils import _dump_json
-
     emp_tt = (timetable_json or {}).get("emp_timetable", {}) or {}
 
     from_flat = list(emp_tt.get("") or [])
@@ -96,10 +84,11 @@ def _extract_all_entries(timetable_json: dict) -> list:
 
     _log(f"[courses] raw sources: empty_key={len(from_flat)}  NEWTT={len(from_newtt)}")
 
-    try:
-        _dump_json(timetable_json, _P.home() / "icloudems_timetable_raw.json")
-    except Exception:
-        pass
+    if DEBUG_MODE:
+        try:
+            _dump_json(timetable_json, Path.home() / "icloudems_timetable_raw.json")
+        except Exception:
+            pass
 
     seen, out = set(), []
     for e in from_flat + from_newtt:
@@ -216,7 +205,7 @@ async def _run_load_job_async(jid: str, client: ICloudEMSClient,
                     "phase": "rosters", "done": completed, "total": total,
                 })
 
-        _log(f"[courses] fetching {total} slot rosters with asyncio.gather (max {_api_semaphore._value} concurrent)...")
+        _log(f"[courses] fetching {total} slot rosters with asyncio.gather (max {ROSTER_FETCH_CONCURRENCY} concurrent)...")
         await asyncio.gather(*[_fetch_one(e) for e in all_entries])
 
         # Assemble per-course results.
@@ -310,7 +299,7 @@ def _run_load_job_thread(jid: str, client: ICloudEMSClient,
 
 @router.post("/{sid}/courses/load", response_model=CoursesLoadResponse)
 def load_courses(sid: str, req: CoursesLoadRequest):
-    client = _get_client(sid)
+    client = get_client(sid)
     jid = jobs.create()
     threading.Thread(
         target=_run_load_job_thread,
@@ -322,7 +311,7 @@ def load_courses(sid: str, req: CoursesLoadRequest):
 
 @router.get("/{sid}/jobs/{jid}")
 def job_status(sid: str, jid: str):
-    _get_client(sid)
+    get_client(sid)
     j = jobs.get(jid)
     if not j:
         raise HTTPException(404, "job not found")
@@ -332,7 +321,7 @@ def job_status(sid: str, jid: str):
 @router.post("/{sid}/slots/state", response_model=SlotStateResponse)
 def slot_state(sid: str, req: SlotStateRequest):
     """Re-fetch one slot's current state. Used by the client after a 409."""
-    client = _get_client(sid)
+    client = get_client(sid)
     clone = client.clone()
     try:
         sd = _fetch_slot(clone, req.entry, req.day_entries)
@@ -348,7 +337,7 @@ def slot_state(sid: str, req: SlotStateRequest):
 @router.post("/{sid}/slots/toggle", response_model=SlotToggleResponse)
 def toggle_slot(sid: str, req: SlotToggleRequest):
     """Toggle one student's presence in one slot."""
-    client = _get_client(sid)
+    client = get_client(sid)
     clone = client.clone()
 
     try:
@@ -415,7 +404,7 @@ def toggle_slot(sid: str, req: SlotToggleRequest):
 @router.post("/{sid}/slots/batch_update", response_model=BatchSlotUpdateResponse)
 async def batch_update_slots(sid: str, req: BatchSlotUpdateRequest):
     """Update multiple lecture slots concurrently with async I/O."""
-    client = _get_client(sid)
+    client = get_client(sid)
 
     async def _process_one(item):
         clone = client.clone()

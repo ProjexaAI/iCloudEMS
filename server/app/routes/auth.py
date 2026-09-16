@@ -1,3 +1,5 @@
+import time
+
 from fastapi import APIRouter, HTTPException
 
 from ..icloudems import ICloudEMSClient
@@ -78,7 +80,6 @@ def refresh(sid: str):
         client.save_to_store(token_store, client.contact)
     except Exception as e:
         raise HTTPException(401, detail=str(e))
-    import time
     claims = ICloudEMSClient.parse_jwt(client.access_token or "")
     exp = claims.get("exp")
     return RefreshResponse(

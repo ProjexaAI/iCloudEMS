@@ -3,7 +3,6 @@ from uuid import uuid4
 from fastapi import APIRouter, HTTPException
 
 from ..icloudems import (
-    ICloudEMSClient,
     build_tt_array_data,
     parse_roster,
 )
@@ -13,22 +12,14 @@ from ..schemas import (
     SubmitRequest, SubmitResponse,
 )
 from ..sessions import store
+from . import get_client
 
 router = APIRouter()
 
 
-def get_client(sid: str):
-    client = store.get(sid)
-    if not client:
-        raise HTTPException(404, "session not found")
-    if not client.empid:
-        raise HTTPException(400, "session has no empid (not logged in?)")
-    return client
-
-
 @router.post("/{sid}/roster", response_model=RosterResponse)
 def roster(sid: str, req: RosterRequest):
-    client: ICloudEMSClient = get_client(sid)
+    client = get_client(sid)
     # !!! ttArrayData must contain the WHOLE day — see quirks.md #3. !!!
     tt_array = build_tt_array_data(req.day_entries)
     resp = client._with_auto_refresh(
@@ -44,7 +35,7 @@ def roster(sid: str, req: RosterRequest):
 
 @router.post("/{sid}/submit", response_model=SubmitResponse)
 def submit(sid: str, req: SubmitRequest):
-    client: ICloudEMSClient = get_client(sid)
+    client = get_client(sid)
 
     key = req.idempotency_key or uuid4().hex
     _log(f"=== SUBMIT sid={sid} key={key} ===")

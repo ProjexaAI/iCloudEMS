@@ -41,11 +41,12 @@ class HTTPError(Exception):
 
 
 class HttpResponse:
-    def __init__(self, status, reason, text, raw):
+    def __init__(self, status, reason, text, raw, method=""):
         self.status_code = status
         self.reason = reason
         self.text = text
         self._raw = raw
+        self.method = method
 
     @property
     def ok(self):
@@ -57,7 +58,7 @@ class HttpResponse:
     def raise_for_status(self):
         if not self.ok:
             raise HTTPError(
-                self.status_code, self.reason, "POST",
+                self.status_code, self.reason, self.method,
                 getattr(self._raw, "url", "?"), self.text
             )
 
@@ -79,7 +80,7 @@ class HttpSession:
         except Exception:
             pass
 
-    def _wrap(self, raw):
+    def _wrap(self, raw, method=""):
         text = ""
         try:
             text = raw.text
@@ -89,7 +90,7 @@ class HttpSession:
             except Exception:
                 text = ""
         reason = getattr(raw, "reason", "") or ""
-        return HttpResponse(raw.status_code, reason, text, raw)
+        return HttpResponse(raw.status_code, reason, text, raw, method=method)
 
     def post(self, url, json=None, data=None, files=None, headers=None, timeout=30):
         merged = dict(self._headers)
@@ -100,7 +101,7 @@ class HttpSession:
                                headers=merged, timeout=timeout)
         except Exception as e:
             raise HTTPError(0, type(e).__name__, "POST", url, str(e))
-        return self._wrap(raw)
+        return self._wrap(raw, method="POST")
 
     def get(self, url, headers=None, timeout=15):
         merged = dict(self._headers)
@@ -110,7 +111,7 @@ class HttpSession:
             raw = self._s.get(url, headers=merged, timeout=timeout)
         except Exception as e:
             raise HTTPError(0, type(e).__name__, "GET", url, str(e))
-        return self._wrap(raw)
+        return self._wrap(raw, method="GET")
 
     def cookies_dict(self):
         try:
@@ -132,7 +133,7 @@ class AsyncHttpSession:
     def update_headers(self, headers):
         self._headers.update(headers)
 
-    def _wrap(self, raw):
+    def _wrap(self, raw, method=""):
         text = ""
         try:
             text = raw.text
@@ -142,7 +143,7 @@ class AsyncHttpSession:
             except Exception:
                 text = ""
         reason = getattr(raw, "reason", "") or ""
-        return HttpResponse(raw.status_code, reason, text, raw)
+        return HttpResponse(raw.status_code, reason, text, raw, method=method)
 
     async def post(self, url, json=None, data=None, files=None, headers=None, timeout=30):
         if self._s is None:
@@ -156,7 +157,7 @@ class AsyncHttpSession:
                                      headers=merged, timeout=timeout)
         except Exception as e:
             raise HTTPError(0, type(e).__name__, "POST", url, str(e))
-        return self._wrap(raw)
+        return self._wrap(raw, method="POST")
 
     async def get(self, url, headers=None, timeout=15):
         if self._s is None:
@@ -169,7 +170,7 @@ class AsyncHttpSession:
             raw = await self._s.get(url, headers=merged, timeout=timeout)
         except Exception as e:
             raise HTTPError(0, type(e).__name__, "GET", url, str(e))
-        return self._wrap(raw)
+        return self._wrap(raw, method="GET")
 
     def cookies_dict(self):
         if self._s is None:

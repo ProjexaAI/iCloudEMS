@@ -7,7 +7,7 @@ import threading
 import time
 import uuid
 
-from ..config import ROSTER_DUMP, SUBMIT_DUMP
+from ..config import ROSTER_DUMP, SUBMIT_DUMP, DEBUG_MODE
 from ..logging_utils import _log, _dump_json
 from .http import HTTPError, HttpResponse, HttpSession, AsyncHttpSession
 
@@ -402,10 +402,11 @@ class ICloudEMSClient:
         )
         self._log("POST ctrl_attendanceTaken ->", r.status_code)
         r.raise_for_status()
-        try:
-            _dump_json(r.json(), ROSTER_DUMP)
-        except Exception:
-            pass
+        if DEBUG_MODE:
+            try:
+                _dump_json(r.json(), ROSTER_DUMP)
+            except Exception:
+                pass
         return r
 
     def submit_attendance(self, empid, entry, students, present_rollno,
@@ -442,7 +443,8 @@ class ICloudEMSClient:
             "updateId": str(update_id) if update_id not in (None, "", 0) else "0",
         }
 
-        _dump_json(payload, SUBMIT_DUMP)
+        if DEBUG_MODE:
+            _dump_json(payload, SUBMIT_DUMP)
         self._log(f"submit: total={len(students)} "
                   f"present_sent={len(present_rollno)} "
                   f"updateId={payload['updateId']}")
@@ -479,7 +481,7 @@ class ICloudEMSClient:
                 raw = self.plain_session.post(
                     url, files=files_dict, headers=headers, timeout=60
                 )
-                r = HttpResponse(raw.status_code, raw.reason, raw.text, raw)
+                r = HttpResponse(raw.status_code, raw.reason, raw.text, raw, method="POST")
                 self._log("submit(plain) ->", r.status_code)
             except Exception as ex:
                 self._log("submit(plain) transport error:", ex)
@@ -500,8 +502,13 @@ class ICloudEMSClient:
             if e.status != 401:
                 raise
             self._log("got 401, attempting refresh…")
-            with _refresh_lock:
-                self.refresh()
+            try:
+                with _refresh_lock:
+                    self.refresh()
+            except Exception as refresh_err:
+                self._log("refresh failed:", refresh_err)
+                raise HTTPError(401, "Session expired and refresh failed",
+                                "AUTH", "", "") from e
             return fn(*args, **kwargs)
 
     def clone(self):
@@ -670,10 +677,11 @@ class ICloudEMSClient:
         )
         self._log("async POST ctrl_attendanceTaken ->", r.status_code)
         r.raise_for_status()
-        try:
-            _dump_json(r.json(), ROSTER_DUMP)
-        except Exception:
-            pass
+        if DEBUG_MODE:
+            try:
+                _dump_json(r.json(), ROSTER_DUMP)
+            except Exception:
+                pass
         return r
 
     async def _with_auto_refresh_async(self, fn, *args, **kwargs):
@@ -683,6 +691,11 @@ class ICloudEMSClient:
             if e.status != 401:
                 raise
             self._log("got 401, attempting refresh…")
-            with _refresh_lock:
-                self.refresh()
+            try:
+                with _refresh_lock:
+                    self.refresh()
+            except Exception as refresh_err:
+                self._log("refresh failed:", refresh_err)
+                raise HTTPError(401, "Session expired and refresh failed",
+                                "AUTH", "", "") from e
             return await fn(*args, **kwargs)
