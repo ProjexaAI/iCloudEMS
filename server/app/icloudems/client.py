@@ -37,7 +37,11 @@ class ICloudEMSClient:
         "3zk_-MQZHegjIHMeDVrVHByT5XnI2mIWTufQ9Y4Tc6M"
     )
 
-    USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"
+    USER_AGENT = (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/136.0.0.0 Safari/537.36"
+    )
 
     def __init__(self, debug=True):
         self.session = HttpSession()
@@ -123,7 +127,8 @@ class ICloudEMSClient:
         elif self.access_token:
             h["Authorization"] = self.access_token
         if referer:
-            h["Referer"] = referer
+            base = self.API_HOST if use_legacy else self.KRMU_HOST
+            h["Referer"] = f"{base}/{referer}"
         return h
 
     def _log(self, *a):
