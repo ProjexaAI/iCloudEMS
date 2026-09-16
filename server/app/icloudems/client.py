@@ -1,0 +1,509 @@
+"""ICloudEMS HTTP client. See quirks.md for the rules this encodes."""
+import base64
+import json
+import re
+import time
+import uuid
+
+from ..config import ROSTER_DUMP, SUBMIT_DUMP
+from ..logging_utils import _log, _dump_json
+from .http import HTTPError, HttpResponse, HttpSession
+
+try:
+    import requests as _plain_requests
+except ImportError:
+    _plain_requests = None
+
+
+class ICloudEMSClient:
+    API_HOST  = "https://api.icloudems.com"
+    KRMU_HOST = "https://krmu.icloudems.com"
+    APP_VERSION = "3.0.9"
+    CLIENT = "KRMU"
+    BR_ID = 4
+
+    # !!! DO NOT CHANGE !!!
+    # Hardcoded legacy JWT for /users/login, /validate, /refresh.
+    # Sent RAW (no "Bearer " prefix).
+    LEGACY_AUTH = (
+        "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9."
+        "eyJpZCI6IjE0ODY0MSIsImlhdCI6MTcyMDQxMjE5MiwiZXhwIjoxNzIwNDQ4MTkyfQ."
+        "3zk_-MQZHegjIHMeDVrVHByT5XnI2mIWTufQ9Y4Tc6M"
+    )
+
+    USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"
+
+    def __init__(self, debug=True):
+        self.session = HttpSession()
+        self.session.update_headers({
+            "User-Agent": self.USER_AGENT,
+            "Accept": "application/json",
+            "Accept-Encoding": "gzip, deflate, br",
+            "Content-Type": "application/json",
+        })
+
+        # !!! DO NOT REMOVE !!!
+        # Plain requests session used ONLY for submit. curl_cffi's Chrome
+        # impersonation sends sec-ch-ua* headers that the submit WAF flags.
+        self.plain_session = _plain_requests.Session() if _plain_requests else None
+        if self.plain_session is not None:
+            self.plain_session.headers.update({
+                "User-Agent": self.USER_AGENT,
+                "Accept": "application/json",
+                "Accept-Encoding": "gzip",
+            })
+
+        self.access_token = None
+        self.refresh_token = None
+        self.device_id = self._generate_device_id()
+        self.username = None
+        self.contact = None
+        self.empid = None
+        self._warmed = False
+        self.debug = debug
+
+    # ---------- helpers ----------
+
+    @staticmethod
+    def _generate_device_id():
+        parts = []
+        for length in (16, 8, 7, 8, 16, 8):
+            parts.append(uuid.uuid4().hex[:length])
+        return "-" + "-".join(parts)
+
+    @staticmethod
+    def parse_jwt(token):
+        try:
+            payload = token.split(".")[1]
+            payload += "=" * (-len(payload) % 4)
+            return json.loads(base64.urlsafe_b64decode(payload))
+        except Exception:
+            return {}
+
+    @staticmethod
+    def token_is_valid(token, skew=30):
+        if not token:
+            return False
+        claims = ICloudEMSClient.parse_jwt(token)
+        exp = claims.get("exp")
+        if not exp:
+            return False
+        return time.time() < (exp - skew)
+
+    def _auth_headers(self, referer=None, use_legacy=False):
+        # !!! DO NOT CHANGE TO "Bearer ..." !!!
+        h = {}
+        if use_legacy:
+            h["Authorization"] = self.LEGACY_AUTH
+        elif self.access_token:
+            h["Authorization"] = self.access_token
+        if referer:
+            h["Referer"] = referer
+        return h
+
+    def _log(self, *a):
+        if self.debug:
+            _log("[icloudems]", *a)
+
+    # ---------- session persistence ----------
+
+    def load_from_store(self, store, email):
+        rec = store.get(email)
+        if not rec:
+            return False
+        self.contact = rec.get("contact") or email
+        self.username = rec.get("username")
+        self.empid = rec.get("empid")
+        self.access_token = rec.get("access_token")
+        self.refresh_token = rec.get("refresh_token")
+        if rec.get("device_id"):
+            self.device_id = rec["device_id"]
+        return True
+
+    def save_to_store(self, store, email):
+        store.set(email, {
+            "contact": self.contact,
+            "username": self.username,
+            "empid": self.empid,
+            "access_token": self.access_token,
+            "refresh_token": self.refresh_token,
+            "device_id": self.device_id,
+            "saved_at": time.time(),
+        })
+
+    def clear_session(self, keep_device_id=True):
+        self.access_token = None
+        self.refresh_token = None
+        if not keep_device_id:
+            self.device_id = self._generate_device_id()
+
+    # ---------- auth ----------
+
+    def send_otp(self, email):
+        self.contact = email
+        payload = {
+            "method": "email",
+            "contact": email,
+            "lastmodifiedby": email,
+            "deviceid": self.device_id,
+            "appversion": self.APP_VERSION,
+        }
+        r = self.session.post(
+            f"{self.API_HOST}/users/login",
+            json=payload,
+            headers=self._auth_headers(referer="users/login", use_legacy=True),
+            timeout=30,
+        )
+        self._log("send_otp ->", r.status_code)
+        r.raise_for_status()
+        data = r.json()
+        if data.get("status") == "success":
+            d = data.get("data") or {}
+            self.username = (
+                d.get("username") or d.get("user_name") or
+                d.get("user") or data.get("username") or self.username
+            )
+        return data
+
+    def validate_otp(self, otp):
+        otp_clean = re.sub(r"\D", "", str(otp))
+        payload = {
+            "otp": otp_clean,
+            "contact": self.contact,
+            "username": self.username or self.contact,
+            "lastmodifiedby": self.contact,
+            "deviceid": self.device_id,
+            "appversion": self.APP_VERSION,
+        }
+        r = self.session.post(
+            f"{self.API_HOST}/users/login/validate",
+            json=payload,
+            headers=self._auth_headers(referer="users/login/validate",
+                                       use_legacy=True),
+            timeout=30,
+        )
+        self._log("validate_otp ->", r.status_code)
+        data = {}
+        try:
+            data = r.json()
+        except Exception:
+            pass
+        token = (data.get("data") or {}).get("token") or {}
+        if token.get("access_token"):
+            self.access_token = token["access_token"]
+            self.refresh_token = token["refresh_token"]
+            claims = self.parse_jwt(self.access_token)
+            self.empid = claims.get("admno") or self.empid
+        return data
+
+    def refresh(self):
+        # !!! DO NOT CHANGE !!! Legacy JWT + both tokens in body.
+        payload = {
+            "refreshtoken": self.refresh_token,
+            "accesstoken": self.access_token,
+            "lastmodifiedby": self.contact,
+        }
+        r = self.session.post(
+            f"{self.API_HOST}/users/login/refresh",
+            json=payload,
+            headers=self._auth_headers(referer="users/login/refresh",
+                                       use_legacy=True),
+            timeout=30,
+        )
+        self._log("refresh ->", r.status_code)
+        r.raise_for_status()
+        data = r.json()
+        token = (data.get("data") or {}).get("token") or {}
+        if token.get("access_token"):
+            self.access_token = token["access_token"]
+            self.refresh_token = token["refresh_token"]
+            claims = self.parse_jwt(self.access_token)
+            if claims.get("admno"):
+                self.empid = claims["admno"]
+        return data
+
+    # ---------- corecampus ----------
+
+    def warmup(self):
+        if self._warmed:
+            return
+        try:
+            r = self.session.get(self.KRMU_HOST + "/", timeout=15)
+            self._log("GET krmu / ->", r.status_code)
+        except Exception as e:
+            self._log("warmup failed:", e)
+        if self.plain_session is not None:
+            try:
+                for k, v in self.session.cookies_dict().items():
+                    self.plain_session.cookies.set(k, v)
+            except Exception:
+                pass
+        self._warmed = True
+
+    def get_timetable_week(self, empid, start_date, end_date, action="wdefault"):
+        """Fetch a single Monday-to-Sunday week's timetable.
+
+        Action must be 'wdefault', 'previous', or 'next'.
+        Always uses strict Monday-to-Sunday weekly boundaries matching the mobile app.
+        """
+        self.warmup()
+        r = self.session.post(
+            f"{self.KRMU_HOST}/corecampus/admin/schedulerand/"
+            f"ctrl_tt_report_emp_rum.php",
+            json={
+                "action": action,
+                "attendanceFlag": 1,
+                "client": self.CLIENT,
+                "empid": str(empid),
+                "endDate": end_date,
+                "from": "app",
+                "method": "getData",
+                "room": "",
+                "startDate": start_date,
+                "br_id": self.BR_ID,
+            },
+            headers=self._auth_headers(
+                referer="corecampus/admin/schedulerand/"
+                        "ctrl_tt_report_emp_rum.php"),
+            timeout=60,
+        )
+        self._log(f"POST ctrl_tt_report ({action} {start_date}..{end_date}) ->", r.status_code)
+        r.raise_for_status()
+        return r.json()
+
+    def get_timetable(self, empid, start_date, end_date):
+        """Fetch timetable strictly in weekly requests, paging with previous/next as needed.
+
+        iCloudEMS never accepts wide arbitrary multi-week ranges in a single call;
+        it always operates one Monday-to-Sunday week at a time.
+        We start with the reference week for end_date and page backwards using 'previous'
+        (or forwards using 'next') until the entire requested range [start_date, end_date] is covered.
+        All weekly responses are merged into a unified timetable structure.
+        """
+        from datetime import datetime, timedelta
+
+        dt_start = datetime.strptime(start_date, "%Y-%m-%d")
+        dt_end = datetime.strptime(end_date, "%Y-%m-%d")
+
+        target_start_monday = (dt_start - timedelta(days=dt_start.weekday())).strftime("%Y-%m-%d")
+        target_end_monday = (dt_end - timedelta(days=dt_end.weekday())).strftime("%Y-%m-%d")
+        target_end_sunday = (dt_end - timedelta(days=dt_end.weekday()) + timedelta(days=6)).strftime("%Y-%m-%d")
+
+        # Start with the reference week for the end_date
+        ref_monday = target_end_monday
+        ref_sunday = target_end_sunday
+
+        first_week = self.get_timetable_week(empid, ref_monday, ref_sunday, action="wdefault")
+        weekly_responses = [first_week]
+
+        # 1. Page backwards using 'previous' if target_start_monday is before current week
+        curr = first_week
+        while True:
+            emp_tt = curr.get("emp_timetable", {}) or {}
+            curr_start = emp_tt.get("StartDate")
+            curr_end = emp_tt.get("EndDate")
+            if not curr_start or curr_start <= target_start_monday:
+                break
+            prev = self.get_timetable_week(empid, curr_start, curr_end, action="previous")
+            prev_emp_tt = prev.get("emp_timetable", {}) or {}
+            new_start = prev_emp_tt.get("StartDate")
+            new_end = prev_emp_tt.get("EndDate")
+            if not new_start or new_start >= curr_start:
+                break
+            weekly_responses.append(prev)
+            curr = prev
+
+        # 2. Page forwards using 'next' if target_end_monday is after first_week's StartDate
+        curr = first_week
+        while True:
+            emp_tt = curr.get("emp_timetable", {}) or {}
+            curr_start = emp_tt.get("StartDate")
+            curr_end = emp_tt.get("EndDate")
+            if not curr_end or curr_end >= target_end_sunday:
+                break
+            nxt = self.get_timetable_week(empid, curr_start, curr_end, action="next")
+            nxt_emp_tt = nxt.get("emp_timetable", {}) or {}
+            new_start = nxt_emp_tt.get("StartDate")
+            new_end = nxt_emp_tt.get("EndDate")
+            if not new_end or new_end <= curr_end:
+                break
+            weekly_responses.append(nxt)
+            curr = nxt
+
+        # Merge all weekly responses
+        merged_emp_tt = {
+            "": [],
+            "NEWTT": {},
+            "StartDate": start_date,
+            "EndDate": end_date,
+        }
+        for resp in weekly_responses:
+            emp_tt = resp.get("emp_timetable", {}) or {}
+            flat = emp_tt.get("", [])
+            if isinstance(flat, list):
+                merged_emp_tt[""].extend(flat)
+            newtt = emp_tt.get("NEWTT", {}) or {}
+            if isinstance(newtt, dict):
+                for day, by_from in newtt.items():
+                    if not isinstance(by_from, dict):
+                        continue
+                    day_dict = merged_emp_tt["NEWTT"].setdefault(day, {})
+                    for ft, by_to in by_from.items():
+                        if not isinstance(by_to, dict):
+                            continue
+                        ft_dict = day_dict.setdefault(ft, {})
+                        for tt, entries in by_to.items():
+                            if not isinstance(entries, list):
+                                continue
+                            ft_dict.setdefault(tt, []).extend(entries)
+
+        return {"emp_timetable": merged_emp_tt, "status": "success"}
+
+    def get_attendance_default(self, empid, entry, tt_array_data):
+        # !!! DO NOT send only the picked slot in ttArrayData !!!
+        r = self.session.post(
+            f"{self.KRMU_HOST}/corecampus/admin/attendance/"
+            f"ctrl_attendanceTaken.php",
+            json={
+                "from": "app",
+                "method": "getAttendanceDefault",
+                "classid": str(entry.get("classid") or entry.get("classId")),
+                "fromtime": entry.get("fromTime"),
+                "totime": entry.get("toTime"),
+                "date": entry.get("fromDate"),
+                "division": entry.get("division"),
+                "subjectId": str(entry.get("subjectId")),
+                "batchId": str(entry.get("batchGroupId") or entry.get("batch")),
+                "ttArrayData": tt_array_data,
+                "containerId": str(entry.get("containerId", "0")),
+                "empid": str(empid),
+                "br_id": self.BR_ID,
+                "client": self.CLIENT,
+                "attendTakenFlag": 1,
+            },
+            headers=self._auth_headers(
+                referer="corecampus/admin/attendance/"
+                        "ctrl_attendanceTaken.php"),
+            timeout=60,
+        )
+        self._log("POST ctrl_attendanceTaken ->", r.status_code)
+        r.raise_for_status()
+        try:
+            _dump_json(r.json(), ROSTER_DUMP)
+        except Exception:
+            pass
+        return r
+
+    def submit_attendance(self, empid, entry, students, present_rollno,
+                          academicyear, update_id, force=False):
+        # Circuit breaker: prevent accidental mass-absent wipeouts
+        if len(students) >= 10 and len(present_rollno) <= 1 and not force:
+            raise ValueError(
+                f"Safety circuit breaker: Refusing to submit attendance where only "
+                f"{len(present_rollno)} of {len(students)} students are marked present. "
+                f"Pass force=True if this mass-absent submission is intentional."
+            )
+
+        payload = {
+            "fromTime": entry.get("fromTime"),
+            "toTime": entry.get("toTime"),
+            "priv_id": str(empid),
+            "extra_lec": "0",
+            "exatraLecRem": "",
+            "division": entry.get("division"),
+            "classId": str(entry.get("classid") or entry.get("classId")),
+            "branch_id": int(entry.get("br_id") or self.BR_ID),
+            "batchId": str(entry.get("batchGroupId") or entry.get("batch")),
+            "subjectId": str(entry.get("subjectId")),
+            "attdate": entry.get("fromDate"),
+            "academicyear": academicyear,
+            "adm": {s: s for s in students},
+            # !!! FIELD NAME IS MISLEADING — this is the PRESENT list !!!
+            "absent_rollno": list(present_rollno),
+            "remark": {s: "None" for s in students},
+            "teachingplan_lec": "0",
+            "containerId": str(entry.get("containerId", "0")),
+            "copyAttTime": {},
+            # !!! MUST be the current roster takenAttdId !!!
+            "updateId": str(update_id) if update_id not in (None, "", 0) else "0",
+        }
+
+        _dump_json(payload, SUBMIT_DUMP)
+        self._log(f"submit: total={len(students)} "
+                  f"present_sent={len(present_rollno)} "
+                  f"updateId={payload['updateId']}")
+
+        url = (f"{self.KRMU_HOST}/corecampus/admin/attendance/"
+               f"attendanceTakenSubmit.php")
+
+        # !!! DO NOT add sec-ch-ua* headers here !!!
+        headers = {
+            "Authorization": self.access_token or "",
+            "Referer": "corecampus/admin/attendance/attendanceTakenSubmit.php",
+            "Origin": self.KRMU_HOST,
+            "Accept": "application/json",
+            "Accept-Encoding": "gzip",
+            "User-Agent": self.USER_AGENT,
+            "Sec-Fetch-Site": "same-origin",
+            "Sec-Fetch-Mode": "cors",
+            "Sec-Fetch-Dest": "empty",
+        }
+
+        files_dict = {
+            "code": (None, self.CLIENT),
+            "client": (None, self.CLIENT),
+            "from": (None, "app"),
+            "jwt_token": (None, self.access_token or ""),
+            "sessionId": (None, str(uuid.uuid4())),
+            "json": (None, json.dumps(payload)),
+        }
+
+        r = None
+        # !!! Prefer the plain session here !!!
+        if self.plain_session is not None:
+            try:
+                raw = self.plain_session.post(
+                    url, files=files_dict, headers=headers, timeout=60
+                )
+                r = HttpResponse(raw.status_code, raw.reason, raw.text, raw)
+                self._log("submit(plain) ->", r.status_code)
+            except Exception as ex:
+                self._log("submit(plain) transport error:", ex)
+
+        if r is None or (not r.ok and "dev tool" in r.text.lower()):
+            r = self.session.post(
+                url, files=files_dict, headers=headers, timeout=60
+            )
+            self._log("submit(cffi) ->", r.status_code)
+
+        r.raise_for_status()
+        return r
+
+    def _with_auto_refresh(self, fn, *args, **kwargs):
+        try:
+            return fn(*args, **kwargs)
+        except HTTPError as e:
+            if e.status != 401:
+                raise
+            self._log("got 401, attempting refresh…")
+            self.refresh()
+            return fn(*args, **kwargs)
+
+    def clone(self):
+        """Return an independent copy that shares auth state.
+
+        Each clone gets its own curl_cffi + requests sessions, so a
+        toggle submit can run concurrently with the history job without
+        fighting for the same connections. Tokens are copied by value;
+        a refresh on one clone does NOT propagate to the other, which is
+        fine for our write-then-read toggle flow.
+        """
+        c = ICloudEMSClient(debug=self.debug)
+        c.access_token = self.access_token
+        c.refresh_token = self.refresh_token
+        c.device_id = self.device_id
+        c.username = self.username
+        c.contact = self.contact
+        c.empid = self.empid
+        c._warmed = False
+        return c
