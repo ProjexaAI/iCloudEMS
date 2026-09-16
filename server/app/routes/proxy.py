@@ -10,13 +10,7 @@ from ..icloudems import extract_entries_for_date, parse_roster, build_tt_array_d
 from ..logging_utils import _log
 from ..mirror import mirror
 from ..runtime_state import request_fingerprint, runtime_state
-from ..schemas import (
-    ProxyIngestRequest,
-    TimetableResponse,
-    RosterResponse,
-    StudentModel,
-    SubmitResponse,
-)
+from ..schemas import ProxyIngestRequest
 from ..storage import create_token_store
 from . import get_client
 
@@ -57,7 +51,7 @@ def proxy_ingest(sid: str, req: ProxyIngestRequest) -> dict:
             except Exception as err:
                 _log(f"[proxy/ingest/timetable] mirror write error: {err}")
         entries = extract_entries_for_date(raw, target_date) if target_date else []
-        return TimetableResponse(date=target_date, entries=entries)
+        return {"date": target_date, "entries": entries}
 
     # --- roster ---
     if route == "roster":
@@ -75,11 +69,11 @@ def proxy_ingest(sid: str, req: ProxyIngestRequest) -> dict:
                 })
             except Exception as err:
                 _log(f"[proxy/ingest/roster] mirror write error: {err}")
-        return RosterResponse(
-            students=[StudentModel(**s) for s in students],
-            update_id=str(update_id) if update_id not in (None, "", 0) else None,
-            taken_flag=taken_flag,
-        )
+        return {
+            "students": [{"rollno": s["rollno"], "admno": s["admno"], "name": s["name"], "present": s["present"], "known": s["known"]} for s in students],
+            "update_id": str(update_id) if update_id not in (None, "", 0) else None,
+            "taken_flag": taken_flag,
+        }
 
     # --- submit ---
     if route == "submit":
@@ -111,6 +105,6 @@ def proxy_ingest(sid: str, req: ProxyIngestRequest) -> dict:
                 })
             except Exception as err:
                 _log(f"[proxy/ingest/submit] mirror write error: {err}")
-        return response
+        return {"ok": True, "stored_present": present, "stored_absent": absent}
 
     raise HTTPException(400, f"unknown proxy route: {route}")
