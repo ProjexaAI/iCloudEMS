@@ -1,5 +1,6 @@
 """Verification of short-lived tokens issued by the Projexa backend."""
 from fastapi import HTTPException, Request
+from fastapi.responses import JSONResponse
 import jwt
 import re
 
@@ -38,12 +39,15 @@ async def projexa_auth_middleware(request: Request, call_next):
         return await call_next(request)
     authorization = request.headers.get("Authorization", "")
     if not authorization.startswith("Bearer "):
-        raise HTTPException(401, "Projexa bearer token required")
-    request.state.projexa_user = verify_projexa_token(authorization[7:].strip())
+        return JSONResponse(status_code=401, content={"detail": "Projexa bearer token required"})
+    try:
+        request.state.projexa_user = verify_projexa_token(authorization[7:].strip())
+    except HTTPException as exc:
+        return JSONResponse(status_code=exc.status_code, content={"detail": exc.detail})
     match = re.match(r"^/sessions/([^/]+)", request.url.path)
     if match:
         from .sessions import store
         subject = request.state.projexa_user["sub"]
         if not store.owns_identity(match.group(1), subject):
-            raise HTTPException(403, "session does not belong to Projexa user")
+            return JSONResponse(status_code=403, content={"detail": "session does not belong to Projexa user"})
     return await call_next(request)

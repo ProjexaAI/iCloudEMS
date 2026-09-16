@@ -62,7 +62,8 @@ async def request_context(request: Request, call_next):
     try:
         response = await call_next(request)
     except Exception:
-        _log(f"request failed id={request_id} method={request.method} path={request.url.path}")
+        import traceback
+        _log(f"request failed id={request_id} method={request.method} path={request.url.path}\n{traceback.format_exc()}")
         return JSONResponse(
             status_code=500,
             content={"code": "INTERNAL_ERROR", "message": "internal server error", "request_id": request_id},
