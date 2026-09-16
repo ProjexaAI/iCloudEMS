@@ -4,15 +4,18 @@ The rest of the UI only ever calls these methods — no requests, no URLs,
 no JSON shapes leak out.
 """
 import os
+import uuid
 
 import requests
 
 
 class ServerError(Exception):
-    def __init__(self, status, message, detail=None):
+    def __init__(self, status, message, detail=None, request_id=None, code=None):
         self.status = status
         self.message = message
         self.detail = detail
+        self.request_id = request_id
+        self.code = code
         super().__init__(f"{status}: {message}")
 
 
@@ -26,6 +29,7 @@ class ServerClient:
         self.session_id = None
         self.email = None
         self.empid = None
+        self.http = requests.Session()
 
     # ---------- plumbing ----------
 
@@ -33,32 +37,58 @@ class ServerClient:
         if r.ok:
             return r.json()
         detail = None
+        request_id = r.headers.get("X-Request-ID")
+        code = None
         try:
             body = r.json()
             detail = body.get("detail")
+            code = body.get("code")
+            request_id = body.get("request_id") or request_id
+            message = body.get("message")
         except Exception:
             detail = None
+            message = None
         if isinstance(detail, dict):
             msg = detail.get("message") or str(detail)
         elif isinstance(detail, str):
             msg = detail
+        elif message:
+            msg = message
         else:
             msg = r.text[:400] if r.text else "(empty response)"
-        raise ServerError(r.status_code, msg, detail)
+        if request_id:
+            msg = f"{msg} (request {request_id})"
+        raise ServerError(r.status_code, msg, detail, request_id, code)
+
+    def _headers(self):
+        return {"X-Request-ID": uuid.uuid4().hex}
 
     def _post(self, path, json=None, timeout=120):
         try:
-            r = requests.post(self.base_url + path, json=json or {}, timeout=timeout)
+            r = self.http.post(
+                self.base_url + path,
+                json=json or {},
+                headers=self._headers(),
+                timeout=timeout,
+            )
         except requests.RequestException as e:
             raise ServerError(0, f"transport error: {e}")
         return self._check(r)
 
     def _get(self, path, params=None, timeout=60):
         try:
-            r = requests.get(self.base_url + path, params=params or {}, timeout=timeout)
+            r = self.http.get(
+                self.base_url + path,
+                params=params or {},
+                headers=self._headers(),
+                timeout=timeout,
+            )
         except requests.RequestException as e:
             raise ServerError(0, f"transport error: {e}")
         return self._check(r)
+
+    def health(self):
+        return self._get("/health/ready", timeout=10)
 
     # ---------- auth ----------
 
@@ -81,8 +111,9 @@ class ServerClient:
         if not self.session_id:
             return
         try:
-            requests.delete(
-                f"{self.base_url}/sessions/{self.session_id}", timeout=30
+            r = self.http.delete(
+                f"{self.base_url}/sessions/{self.session_id}",
+                headers=self._headers(), timeout=30
             )
         except Exception:
             pass
@@ -92,8 +123,9 @@ class ServerClient:
         if not self.session_id:
             return
         try:
-            requests.delete(
-                f"{self.base_url}/sessions/{self.session_id}/saved", timeout=30
+            r = self.http.delete(
+                f"{self.base_url}/sessions/{self.session_id}/saved",
+                headers=self._headers(), timeout=30
             )
         except Exception:
             pass
@@ -128,14 +160,36 @@ class ServerClient:
 
     # ---------- by-course flow (new) ----------
 
-    def load_courses(self, date_from, date_to):
+    def load_courses(self, date_from, date_to, force=False, subject_id=None,
+                     sync_day=None, slot_keys=None):
+        payload = {"date_from": date_from, "date_to": date_to, "force": force}
+        if subject_id is not None:
+            payload["subject_id"] = subject_id
+        if sync_day is not None:
+            payload["sync_day"] = sync_day
+        if slot_keys is not None:
+            payload["slot_keys"] = slot_keys
         return self._post(
             f"/sessions/{self.session_id}/courses/load",
-            {"date_from": date_from, "date_to": date_to},
+            payload,
         )
 
     def job_status(self, job_id):
         return self._get(f"/sessions/{self.session_id}/jobs/{job_id}")
+
+    def sync_status(self):
+        return self._get(f"/sessions/{self.session_id}/sync/status")
+
+    def student_attendance(self, student_admno, date_from=None, date_to=None):
+        params = {}
+        if date_from:
+            params["date_from"] = date_from
+        if date_to:
+            params["date_to"] = date_to
+        return self._get(
+            f"/sessions/{self.session_id}/students/{student_admno}/attendance",
+            params,
+        )
 
     def slot_state(self, entry, day_entries):
         return self._post(

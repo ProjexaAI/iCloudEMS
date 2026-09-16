@@ -329,6 +329,7 @@ class AttendanceApp:
         self.login_status.config(text="Contacting server…")
 
         def do():
+            self.api.health()
             return self.api.start_login(email)
 
         def ok(data):

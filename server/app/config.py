@@ -2,6 +2,14 @@
 import os
 from pathlib import Path
 
+try:
+	from dotenv import load_dotenv
+except ImportError:
+	load_dotenv = None
+
+if load_dotenv is not None:
+	load_dotenv(Path(__file__).resolve().parents[1] / ".env")
+
 def _env_bool(name: str, default: bool) -> bool:
 	value = os.getenv(name)
 	if value is None:
@@ -29,8 +37,10 @@ SERVER_HOST = os.getenv("SERVER_HOST", "127.0.0.1")
 SERVER_PORT = _env_int("SERVER_PORT", 8000, 1, 65535)
 
 ROSTER_FETCH_CONCURRENCY = _env_int("ROSTER_FETCH_CONCURRENCY", 20, 1, 100)
+ROSTER_CACHE_TTL_SECONDS = _env_int("ROSTER_CACHE_TTL_SECONDS", 86400, 60, 2592000)
 MAX_JOBS_PER_SESSION = _env_int("MAX_JOBS_PER_SESSION", 2, 1, 20)
 MAX_REQUESTS_PER_MINUTE = _env_int("MAX_REQUESTS_PER_MINUTE", 120, 1, 10000)
+CACHE_RETENTION_DAYS = _env_int("CACHE_RETENTION_DAYS", 730, 30, 3650)
 
 DEFAULT_ACADEMIC_YEAR = "2026-2027"
 

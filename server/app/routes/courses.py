@@ -22,9 +22,13 @@ import asyncio
 import concurrent.futures
 import threading
 from pathlib import Path
+from typing import Optional
 from fastapi import APIRouter, HTTPException
 
-from ..config import ROSTER_FETCH_CONCURRENCY, DEFAULT_ACADEMIC_YEAR, DEBUG_MODE
+from ..config import (
+    ROSTER_FETCH_CONCURRENCY, ROSTER_CACHE_TTL_SECONDS,
+    DEFAULT_ACADEMIC_YEAR, DEBUG_MODE,
+)
 
 from ..icloudems import (
     ICloudEMSClient,
@@ -33,6 +37,7 @@ from ..icloudems import (
 )
 from ..jobs import jobs
 from ..logging_utils import _log, _dump_json
+from ..mirror import mirror
 from ..schemas import (
     CoursesLoadRequest, CoursesLoadResponse,
     SlotToggleRequest, SlotToggleResponse,
@@ -45,15 +50,16 @@ from . import get_client
 
 router = APIRouter()
 
-# Global async semaphore: caps concurrent iCloudEMS API calls.
-_api_semaphore = asyncio.Semaphore(ROSTER_FETCH_CONCURRENCY)
-
-
 # ---------- helpers ----------
 
 def _slot_key(e: dict) -> str:
     cls = e.get("classid") or e.get("classId") or ""
-    return f"{e.get('fromDate')}|{e.get('fromTime')}|{e.get('toTime')}|{cls}"
+    subject = e.get("subjectId") or ""
+    division = e.get("division") or ""
+    batch = e.get("batchGroupId") or e.get("batch") or ""
+    container = e.get("containerId") or ""
+    return (f"{e.get('fromDate')}|{e.get('fromTime')}|{e.get('toTime')}|"
+            f"{cls}|{subject}|{division}|{batch}|{container}")
 
 
 def _course_key(e: dict) -> str:
@@ -104,10 +110,11 @@ def _extract_all_entries(timetable_json: dict) -> list:
     return out
 
 
-async def _fetch_slot_async(client: ICloudEMSClient, entry: dict, day_entries: list):
+async def _fetch_slot_async(client: ICloudEMSClient, entry: dict,
+                            day_entries: list, semaphore):
     """Fetch and parse one slot's roster using async I/O."""
     tt_array = build_tt_array_data(day_entries)
-    async with _api_semaphore:
+    async with semaphore:
         resp = await client._with_auto_refresh_async(
             client.get_attendance_default_async, client.empid, entry, tt_array,
         )
@@ -119,6 +126,25 @@ async def _fetch_slot_async(client: ICloudEMSClient, entry: dict, day_entries: l
         "present": {s["admno"] for s in students if s["present"]},
         "students": students,
     }
+
+
+async def _submit_slot_async(client: ICloudEMSClient, entry: dict,
+                             all_admno: list, present_admno: list,
+                             academicyear: str, update_id, force: bool,
+                             semaphore):
+    """Run the provider's sync multipart submit without blocking the event loop."""
+    async with semaphore:
+        await asyncio.to_thread(
+            client._with_auto_refresh,
+            client.submit_attendance,
+            client.empid,
+            entry,
+            all_admno,
+            present_admno,
+            academicyear,
+            update_id,
+            force=force,
+        )
 
 
 def _fetch_slot(client: ICloudEMSClient, entry: dict, day_entries: list):
@@ -140,7 +166,11 @@ def _fetch_slot(client: ICloudEMSClient, entry: dict, day_entries: list):
 # ---------- background job ----------
 
 async def _run_load_job_async(jid: str, client: ICloudEMSClient,
-                              date_from: str, date_to: str) -> None:
+                              date_from: str, date_to: str,
+                              force: bool = False,
+                              subject_id: Optional[str] = None,
+                              sync_day: Optional[str] = None,
+                              slot_keys: Optional[list] = None) -> None:
     """Async version: timetable fetched via sync paging, rosters parallelized."""
     try:
         jobs.update(jid, progress={"phase": "timetable", "done": 0, "total": 1})
@@ -151,7 +181,15 @@ async def _run_load_job_async(jid: str, client: ICloudEMSClient,
         all_entries = [
             e for e in raw_entries
             if e.get("fromDate") and date_from <= e.get("fromDate") <= date_to
+            and (subject_id is None or str(e.get("subjectId")) == str(subject_id))
+            and (sync_day is None or e.get("fromDate") == sync_day)
+            and (slot_keys is None or _slot_key(e) in set(slot_keys))
         ]
+        if mirror is not None:
+            await asyncio.to_thread(
+                mirror.start_sync, client.empid, date_from, date_to,
+                len(all_entries),
+            )
         _log(f"[courses] timetable returned {len(raw_entries)} entries, {len(all_entries)} within {date_from}..{date_to}")
 
         courses_by_key = {}
@@ -176,34 +214,73 @@ async def _run_load_job_async(jid: str, client: ICloudEMSClient,
 
         total = len(all_entries)
         jobs.update(jid, progress={"phase": "rosters", "done": 0, "total": total})
+        api_semaphore = asyncio.Semaphore(ROSTER_FETCH_CONCURRENCY)
+        cached_slots = {}
+        if mirror is not None and not force:
+            cached_slots = await asyncio.to_thread(
+                mirror.cached_slots, client.empid,
+                [_slot_key(entry) for entry in all_entries],
+                ROSTER_CACHE_TTL_SECONDS,
+            )
+            _log(f"[courses] reusing {len(cached_slots)} cached rosters; "
+                 f"fetching {total - len(cached_slots)} missing rosters")
 
         # Fetch ALL rosters concurrently with asyncio.gather — this is
         # the key speed improvement over threading. All N requests fire
         # simultaneously with true async I/O, no GIL, no thread overhead.
         slot_data = {}
+        failed_slots = []
+        cached_count = len(cached_slots)
+        fetched_count = 0
         completed = 0
         progress_lock = asyncio.Lock()
 
         async def _fetch_one(e):
-            nonlocal completed
+            nonlocal completed, fetched_count
             sk = _slot_key(e)
             day_entries = by_date.get(e.get("fromDate"), [])
             worker_client = client.clone()
             try:
-                data = await _fetch_slot_async(worker_client, e, day_entries)
+                data = cached_slots.get(sk)
+                if data is None:
+                    fetched_count += 1
+                    data = await _fetch_slot_async(
+                        worker_client, e, day_entries, api_semaphore,
+                    )
+                    if mirror is not None:
+                        try:
+                            await asyncio.to_thread(
+                                mirror.save_slot, client.empid, sk, e, data,
+                            )
+                        except Exception as mirror_error:
+                            _log(f"[courses] mirror write failed {sk}: {mirror_error!r}")
             except Exception as ex:
                 _log(f"[courses] slot fetch failed {sk}: {ex!r}")
+                failed_slots.append({
+                    "slot_key": sk,
+                    "entry": e,
+                    "day_entries": day_entries,
+                    "error": str(ex),
+                })
                 data = {
                     "taken": False, "update_id": None,
                     "present": set(), "students": [],
                     "error": str(ex),
                 }
-            async with progress_lock:
-                slot_data[sk] = data
-                completed += 1
-                jobs.update(jid, progress={
-                    "phase": "rosters", "done": completed, "total": total,
-                })
+            try:
+                async with progress_lock:
+                    slot_data[sk] = data
+                    completed += 1
+                    completed_count = completed
+                    jobs.update(jid, progress={
+                        "phase": "rosters", "done": completed_count, "total": total,
+                    })
+                if mirror is not None and "error" not in data:
+                    await asyncio.to_thread(
+                        mirror.update_sync, client.empid, slots_done=completed_count,
+                    )
+            finally:
+                await worker_client.async_session.close()
 
         _log(f"[courses] fetching {total} slot rosters with asyncio.gather (max {ROSTER_FETCH_CONCURRENCY} concurrent)...")
         await asyncio.gather(*[_fetch_one(e) for e in all_entries])
@@ -216,7 +293,7 @@ async def _run_load_job_async(jid: str, client: ICloudEMSClient,
             students_map = {}
             for e in entries:
                 sd = slot_data.get(_slot_key(e))
-                if not sd:
+                if not sd or sd.get("error"):
                     continue
                 for s in sd["students"]:
                     students_map[s["admno"]] = s
@@ -225,7 +302,7 @@ async def _run_load_job_async(jid: str, client: ICloudEMSClient,
             for e in entries:
                 sk = _slot_key(e)
                 sd = slot_data.get(sk)
-                if not sd:
+                if not sd or sd.get("error"):
                     continue
                 slot_admnos = {s["admno"] for s in sd["students"]}
                 for admno in students_map:
@@ -246,7 +323,7 @@ async def _run_load_job_async(jid: str, client: ICloudEMSClient,
             for e in entries:
                 sk = _slot_key(e)
                 sd = slot_data.get(sk)
-                if not sd:
+                if not sd or sd.get("error"):
                     continue
                 slots.append({
                     "slot_key": sk,
@@ -273,25 +350,55 @@ async def _run_load_job_async(jid: str, client: ICloudEMSClient,
                 "matrix": matrix,
             })
 
+        if mirror is not None:
+            await asyncio.to_thread(
+                mirror.remove_legacy_slot_keys, client.empid, date_from, date_to,
+            )
+            await asyncio.to_thread(mirror.update_sync, client.empid, status="done")
         jobs.update(jid, status="done", result={
             "date_range": {"from": date_from, "to": date_to},
+            "subject_id": subject_id,
+            "cached_slots": cached_count,
+            "fetched_slots": fetched_count,
+            "failed_slots": failed_slots,
             "courses": result_courses,
         })
     except Exception as ex:
         _log(f"[courses] job failed: {ex!r}")
+        if mirror is not None:
+            try:
+                await asyncio.to_thread(mirror.update_sync, client.empid, status="error", error=str(ex))
+            except Exception as mirror_error:
+                _log(f"[courses] failed to record sync error: {mirror_error!r}")
         jobs.update(jid, status="error", error=str(ex))
 
 
 def _run_load_job_thread(jid: str, client: ICloudEMSClient,
-                         date_from: str, date_to: str) -> None:
+                         date_from: str, date_to: str, force: bool = False,
+                         subject_id: Optional[str] = None,
+                         sync_day: Optional[str] = None,
+                         slot_keys: Optional[list] = None) -> None:
     """Entry point for background thread: creates an event loop and runs the async job."""
     loop = asyncio.new_event_loop()
+    worker_client = None
     try:
         asyncio.set_event_loop(loop)
+        # AsyncSession must be created after this worker loop exists. The
+        # request handler's client belongs to the server event loop.
+        worker_client = client.clone()
         loop.run_until_complete(
-            _run_load_job_async(jid, client, date_from, date_to)
+            _run_load_job_async(
+                jid, worker_client, date_from, date_to, force, subject_id,
+                sync_day,
+                slot_keys,
+            )
         )
     finally:
+        if worker_client is not None:
+            try:
+                loop.run_until_complete(worker_client.async_session.close())
+            except Exception:
+                pass
         loop.close()
 
 
@@ -300,13 +407,27 @@ def _run_load_job_thread(jid: str, client: ICloudEMSClient,
 @router.post("/{sid}/courses/load", response_model=CoursesLoadResponse)
 def load_courses(sid: str, req: CoursesLoadRequest):
     client = get_client(sid)
+    date_from = req.date_from.isoformat()
+    date_to = req.date_to.isoformat()
+    if mirror is not None and not req.force:
+        try:
+            if mirror.has_fresh_sync(client.empid, date_from, date_to):
+                cached = mirror.cached_course_result(client.empid, date_from, date_to)
+                if cached is not None:
+                    jid = jobs.create(owner_sid=sid)
+                    jobs.update(jid, status="done", result=cached,
+                                progress={"phase": "cached", "done": 1, "total": 1})
+                    return CoursesLoadResponse(job_id=jid)
+        except Exception as ex:
+            _log(f"[courses] cache read failed; falling back to sync: {ex!r}")
     try:
         jid = jobs.create(owner_sid=sid)
     except RuntimeError as ex:
         raise HTTPException(429, str(ex)) from ex
     threading.Thread(
         target=_run_load_job_thread,
-        args=(jid, client, req.date_from.isoformat(), req.date_to.isoformat()),
+          args=(jid, client, date_from, date_to, req.force, req.subject_id,
+              req.sync_day.isoformat() if req.sync_day else None, req.slot_keys),
         daemon=True,
     ).start()
     return CoursesLoadResponse(job_id=jid)
@@ -319,6 +440,32 @@ def job_status(sid: str, jid: str):
     if not j:
         raise HTTPException(404, "job not found")
     return j
+
+
+@router.get("/{sid}/sync/status")
+def sync_status(sid: str):
+    client = get_client(sid)
+    if mirror is None:
+        raise HTTPException(503, "attendance mirror is not configured")
+    return mirror.sync_status(client.empid) or {
+        "status": "never_synced", "slots_total": 0, "slots_done": 0,
+    }
+
+
+@router.get("/{sid}/students/{student_admno}/attendance")
+def student_attendance(sid: str, student_admno: str,
+                       date_from: Optional[str] = None,
+                       date_to: Optional[str] = None):
+    client = get_client(sid)
+    if mirror is None:
+        raise HTTPException(503, "attendance mirror is not configured")
+    try:
+        rows = mirror.student_attendance(
+            client.empid, student_admno, date_from, date_to,
+        )
+    except ValueError as exc:
+        raise HTTPException(400, "invalid attendance date") from exc
+    return {"student_admno": student_admno, "records": rows}
 
 
 @router.post("/{sid}/slots/state", response_model=SlotStateResponse)
@@ -408,12 +555,15 @@ def toggle_slot(sid: str, req: SlotToggleRequest):
 async def batch_update_slots(sid: str, req: BatchSlotUpdateRequest):
     """Update multiple lecture slots concurrently with async I/O."""
     client = get_client(sid)
+    api_semaphore = asyncio.Semaphore(ROSTER_FETCH_CONCURRENCY)
 
     async def _process_one(item):
         clone = client.clone()
         sk = _slot_key(item.entry)
         try:
-            sd = await _fetch_slot_async(clone, item.entry, item.day_entries)
+            sd = await _fetch_slot_async(
+                clone, item.entry, item.day_entries, api_semaphore,
+            )
             current_uid = sd["update_id"] or "0"
             expected_uid = item.expected_update_id or "0"
 
@@ -438,14 +588,16 @@ async def batch_update_slots(sid: str, req: BatchSlotUpdateRequest):
             all_admno = [s["admno"] for s in sd["students"]]
             academicyear = item.entry.get("acad_year") or DEFAULT_ACADEMIC_YEAR
 
-            # Submit still uses sync (plain_session has no async version)
-            clone._with_auto_refresh(
-                clone.submit_attendance,
-                clone.empid, item.entry, all_admno, list(item.present_admno),
-                academicyear, sd["update_id"], force=item.force,
+            # The provider requires requests.Session for this multipart call,
+            # so run it in a bounded worker thread instead of blocking asyncio.
+            await _submit_slot_async(
+                clone, item.entry, all_admno, list(item.present_admno),
+                academicyear, sd["update_id"], item.force, api_semaphore,
             )
 
-            sd2 = await _fetch_slot_async(clone, item.entry, item.day_entries)
+            sd2 = await _fetch_slot_async(
+                clone, item.entry, item.day_entries, api_semaphore,
+            )
             return SlotUpdateResult(
                 slot_key=sk, ok=True,
                 new_update_id=sd2["update_id"],
@@ -454,6 +606,11 @@ async def batch_update_slots(sid: str, req: BatchSlotUpdateRequest):
         except Exception as ex:
             _log(f"[batch_update] slot {sk} failed: {ex!r}")
             return SlotUpdateResult(slot_key=sk, ok=False, error=str(ex))
+        finally:
+            await clone.async_session.close()
 
-    results = await asyncio.gather(*[_process_one(item) for item in req.updates])
+    results = await asyncio.gather(
+        *[_process_one(item) for item in req.updates],
+        return_exceptions=False,
+    )
     return BatchSlotUpdateResponse(results=list(results))

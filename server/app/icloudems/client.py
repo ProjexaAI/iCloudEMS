@@ -516,11 +516,16 @@ class ICloudEMSClient:
 
     def _with_auto_refresh(self, fn, *args, **kwargs):
         if self.access_token_needs_refresh() and self.refresh_token:
-            with _refresh_lock:
-                if self.access_token_needs_refresh():
-                    self.refresh()
-                    if self._token_store and self.contact:
-                        self.save_to_store(self._token_store, self.contact)
+            try:
+                with _refresh_lock:
+                    if self.access_token_needs_refresh():
+                        self.refresh()
+                        if self._token_store and self.contact:
+                            self.save_to_store(self._token_store, self.contact)
+            except Exception as refresh_err:
+                self._log("proactive refresh failed:", refresh_err)
+                raise HTTPError(401, "Session expired and refresh failed",
+                                "AUTH", "", "") from refresh_err
         try:
             return fn(*args, **kwargs)
         except HTTPError as e:
@@ -714,11 +719,16 @@ class ICloudEMSClient:
 
     async def _with_auto_refresh_async(self, fn, *args, **kwargs):
         if self.access_token_needs_refresh() and self.refresh_token:
-            with _refresh_lock:
-                if self.access_token_needs_refresh():
-                    self.refresh()
-                    if self._token_store and self.contact:
-                        self.save_to_store(self._token_store, self.contact)
+            try:
+                with _refresh_lock:
+                    if self.access_token_needs_refresh():
+                        self.refresh()
+                        if self._token_store and self.contact:
+                            self.save_to_store(self._token_store, self.contact)
+            except Exception as refresh_err:
+                self._log("proactive refresh failed:", refresh_err)
+                raise HTTPError(401, "Session expired and refresh failed",
+                                "AUTH", "", "") from refresh_err
         try:
             return await fn(*args, **kwargs)
         except HTTPError as e:

@@ -29,3 +29,6 @@ env/
 # Sensitive / token files
 *.tokens.json
 .icloudems_tokens.json
+.env
+.env.*
+!.env.example

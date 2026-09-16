@@ -9,7 +9,6 @@ from typing import Any, Dict, List, Optional
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 
-MAX_ENTRY_FIELDS = 64
 MAX_DAY_ENTRIES = 200
 MAX_STUDENTS = 500
 MAX_BATCH_UPDATES = 100
@@ -83,7 +82,7 @@ class StudentModel(StrictModel):
 
 
 class RosterRequest(StrictModel):
-    entry: Dict[str, Any] = Field(max_length=MAX_ENTRY_FIELDS)
+    entry: Dict[str, Any]
     day_entries: List[Dict[str, Any]] = Field(
         min_length=1, max_length=MAX_DAY_ENTRIES
     )
@@ -96,7 +95,7 @@ class RosterResponse(StrictModel):
 
 
 class SubmitRequest(StrictModel):
-    entry: Dict[str, Any] = Field(max_length=MAX_ENTRY_FIELDS)
+    entry: Dict[str, Any]
     all_admno: List[str] = Field(min_length=1, max_length=MAX_STUDENTS)
     present_admno: List[str] = Field(max_length=MAX_STUDENTS)  # maps to absent_rollno
     update_id: Optional[str] = Field(default=None, max_length=128)
@@ -129,6 +128,10 @@ class SubmitResponse(StrictModel):
 class CoursesLoadRequest(StrictModel):
     date_from: date
     date_to: date
+    force: bool = False
+    subject_id: Optional[str] = Field(default=None, max_length=128)
+    sync_day: Optional[date] = None
+    slot_keys: Optional[List[str]] = Field(default=None, max_length=100)
 
     @model_validator(mode="after")
     def validate_range(self):
@@ -136,6 +139,8 @@ class CoursesLoadRequest(StrictModel):
             raise ValueError("date_to must not be earlier than date_from")
         if (self.date_to - self.date_from).days > 366:
             raise ValueError("date range cannot exceed 366 days")
+        if self.sync_day is not None and not self.date_from <= self.sync_day <= self.date_to:
+            raise ValueError("sync_day must be inside the requested date range")
         return self
 
 
@@ -144,7 +149,7 @@ class CoursesLoadResponse(StrictModel):
 
 
 class SlotToggleRequest(StrictModel):
-    entry: Dict[str, Any] = Field(max_length=MAX_ENTRY_FIELDS)
+    entry: Dict[str, Any]
     day_entries: List[Dict[str, Any]] = Field(min_length=1, max_length=MAX_DAY_ENTRIES)
     student_admno: str = Field(min_length=1, max_length=128)
     present: bool
@@ -157,7 +162,7 @@ class SlotToggleResponse(StrictModel):
 
 
 class SlotStateRequest(StrictModel):
-    entry: Dict[str, Any] = Field(max_length=MAX_ENTRY_FIELDS)
+    entry: Dict[str, Any]
     day_entries: List[Dict[str, Any]] = Field(min_length=1, max_length=MAX_DAY_ENTRIES)
 
 
@@ -168,7 +173,7 @@ class SlotStateResponse(StrictModel):
 
 
 class SlotUpdateRequest(StrictModel):
-    entry: Dict[str, Any] = Field(max_length=MAX_ENTRY_FIELDS)
+    entry: Dict[str, Any]
     day_entries: List[Dict[str, Any]] = Field(min_length=1, max_length=MAX_DAY_ENTRIES)
     present_admno: List[str] = Field(max_length=MAX_STUDENTS)
     expected_update_id: Optional[str] = None

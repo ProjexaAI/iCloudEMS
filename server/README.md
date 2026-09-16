@@ -13,6 +13,9 @@ uses PostgreSQL for encrypted provider tokens and Redis for shared runtime
 state; it refuses to start without those dependencies configured. Do not
 use `--reload` in production.
 
+The server also loads `server/.env` automatically. Keep that file local and
+never commit it; use the deployment platform's secret manager in production.
+
 ## Endpoints
 
     POST   /sessions                         {email}

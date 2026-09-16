@@ -1,0 +1,352 @@
+"""PostgreSQL mirror for timetable and attendance snapshots."""
+import json
+import threading
+from contextlib import closing
+from datetime import datetime, timedelta, timezone
+
+from .config import DATABASE_URL, ENVIRONMENT
+
+
+class MirrorStore:
+    def __init__(self, database_url=None):
+        self.database_url = database_url or DATABASE_URL
+        if not self.database_url:
+            raise RuntimeError("DATABASE_URL is required for the data mirror")
+        try:
+            import psycopg
+            from psycopg.types.json import Jsonb
+        except ImportError as exc:
+            raise RuntimeError("install psycopg for the data mirror") from exc
+        self._psycopg = psycopg
+        self._jsonb = Jsonb
+        self._lock = threading.Lock()
+        self._ensure_schema()
+
+    def _connect(self):
+        return self._psycopg.connect(self.database_url)
+
+    def _ensure_schema(self):
+        with closing(self._connect()) as conn:
+            with conn.cursor() as cur:
+                cur.execute("""
+                    CREATE TABLE IF NOT EXISTS timetable_entries (
+                        empid TEXT NOT NULL,
+                        slot_key TEXT NOT NULL,
+                        from_date DATE NOT NULL,
+                        entry JSONB NOT NULL,
+                        synced_at TIMESTAMPTZ NOT NULL,
+                        PRIMARY KEY (empid, slot_key)
+                    );
+                    CREATE INDEX IF NOT EXISTS timetable_entries_date_idx
+                        ON timetable_entries (empid, from_date);
+                    CREATE TABLE IF NOT EXISTS roster_snapshots (
+                        empid TEXT NOT NULL,
+                        slot_key TEXT NOT NULL,
+                        update_id TEXT,
+                        taken BOOLEAN NOT NULL,
+                        students JSONB NOT NULL,
+                        synced_at TIMESTAMPTZ NOT NULL,
+                        PRIMARY KEY (empid, slot_key)
+                    );
+                    CREATE TABLE IF NOT EXISTS attendance_records (
+                        empid TEXT NOT NULL,
+                        slot_key TEXT NOT NULL,
+                        student_admno TEXT NOT NULL,
+                        present BOOLEAN NOT NULL,
+                        update_id TEXT,
+                        class_date DATE NOT NULL,
+                        synced_at TIMESTAMPTZ NOT NULL,
+                        PRIMARY KEY (empid, slot_key, student_admno)
+                    );
+                    CREATE TABLE IF NOT EXISTS sync_runs (
+                        empid TEXT PRIMARY KEY,
+                        status TEXT NOT NULL,
+                        date_from DATE,
+                        date_to DATE,
+                        slots_total INTEGER NOT NULL DEFAULT 0,
+                        slots_done INTEGER NOT NULL DEFAULT 0,
+                        error TEXT,
+                        started_at TIMESTAMPTZ NOT NULL,
+                        finished_at TIMESTAMPTZ
+                    );
+                    CREATE INDEX IF NOT EXISTS attendance_student_idx
+                        ON attendance_records (empid, student_admno, class_date);
+                """)
+            conn.commit()
+
+    def start_sync(self, empid, date_from, date_to, slots_total=0):
+        now = datetime.now(timezone.utc)
+        with self._lock, closing(self._connect()) as conn:
+            with conn.cursor() as cur:
+                cur.execute("""
+                    INSERT INTO sync_runs
+                        (empid, status, date_from, date_to, slots_total,
+                         slots_done, error, started_at, finished_at)
+                    VALUES (%s, 'running', %s, %s, %s, 0, NULL, %s, NULL)
+                    ON CONFLICT (empid) DO UPDATE SET
+                        status = 'running', date_from = EXCLUDED.date_from,
+                        date_to = EXCLUDED.date_to, slots_total = EXCLUDED.slots_total,
+                        slots_done = 0, error = NULL, started_at = EXCLUDED.started_at,
+                        finished_at = NULL
+                """, (str(empid), date_from, date_to, slots_total, now))
+            conn.commit()
+
+    def update_sync(self, empid, *, slots_done=None, status=None, error=None):
+        fields, values = [], []
+        if slots_done is not None:
+            fields += ["slots_done = %s"]
+            values.append(slots_done)
+        if status is not None:
+            fields += ["status = %s"]
+            values.append(status)
+        if error is not None:
+            fields += ["error = %s"]
+            values.append(error[:1000])
+        if status in {"done", "error"}:
+            fields.append("finished_at = %s")
+            values.append(datetime.now(timezone.utc))
+        if not fields:
+            return
+        values.append(str(empid))
+        with self._lock, closing(self._connect()) as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "UPDATE sync_runs SET " + ", ".join(fields) + " WHERE empid = %s",
+                    values,
+                )
+            conn.commit()
+
+    def remove_legacy_slot_keys(self, empid, date_from, date_to):
+        """Remove rows written with the pre-course-aware slot key format."""
+        with self._lock, closing(self._connect()) as conn:
+            with conn.cursor() as cur:
+                cur.execute("""
+                    DELETE FROM attendance_records
+                    WHERE empid = %s AND class_date BETWEEN %s AND %s
+                      AND array_length(string_to_array(slot_key, '|'), 1) < 8
+                """, (str(empid), date_from, date_to))
+                cur.execute("""
+                    DELETE FROM roster_snapshots
+                    WHERE empid = %s AND slot_key NOT IN (
+                        SELECT slot_key FROM timetable_entries WHERE empid = %s
+                    )
+                """, (str(empid), str(empid)))
+                cur.execute("""
+                    DELETE FROM timetable_entries
+                    WHERE empid = %s AND from_date BETWEEN %s AND %s
+                      AND array_length(string_to_array(slot_key, '|'), 1) < 8
+                """, (str(empid), date_from, date_to))
+            conn.commit()
+
+    def cleanup_old_data(self, retention_days):
+        cutoff = datetime.now(timezone.utc) - timedelta(days=retention_days)
+        with self._lock, closing(self._connect()) as conn:
+            with conn.cursor() as cur:
+                cur.execute("DELETE FROM attendance_records WHERE synced_at < %s", (cutoff,))
+                cur.execute("DELETE FROM roster_snapshots WHERE synced_at < %s", (cutoff,))
+                cur.execute("DELETE FROM timetable_entries WHERE synced_at < %s", (cutoff,))
+                cur.execute("DELETE FROM sync_runs WHERE finished_at < %s", (cutoff,))
+            conn.commit()
+
+    def sync_status(self, empid):
+        with closing(self._connect()) as conn:
+            with conn.cursor() as cur:
+                cur.execute("""
+                    SELECT status, date_from, date_to, slots_total, slots_done,
+                           error, started_at, finished_at
+                    FROM sync_runs WHERE empid = %s
+                """, (str(empid),))
+                row = cur.fetchone()
+        if not row:
+            return None
+        return {
+            "status": row[0], "date_from": row[1].isoformat() if row[1] else None,
+            "date_to": row[2].isoformat() if row[2] else None,
+            "slots_total": row[3], "slots_done": row[4], "error": row[5],
+            "started_at": row[6].isoformat() if row[6] else None,
+            "finished_at": row[7].isoformat() if row[7] else None,
+        }
+
+    def cached_course_result(self, empid, date_from, date_to):
+        """Rebuild the course-history response from the local mirror."""
+        with closing(self._connect()) as conn:
+            with conn.cursor() as cur:
+                cur.execute("""
+                    SELECT t.slot_key, t.entry, r.update_id, r.taken, r.students
+                    FROM timetable_entries t
+                    LEFT JOIN roster_snapshots r
+                      ON r.empid = t.empid AND r.slot_key = t.slot_key
+                    WHERE t.empid = %s AND t.from_date BETWEEN %s AND %s
+                    ORDER BY t.from_date, t.entry->>'fromTime'
+                """, (str(empid), date_from, date_to))
+                rows = cur.fetchall()
+        if not rows:
+            return None
+
+        entries_by_date = {}
+        slots = []
+        for slot_key, entry, update_id, taken, students in rows:
+            entries_by_date.setdefault(entry.get("fromDate"), []).append(entry)
+            students = students or []
+            slots.append({
+                "slot_key": slot_key,
+                "date": entry.get("fromDate"),
+                "fromTime": entry.get("fromTime"),
+                "toTime": entry.get("toTime"),
+                "taken": bool(taken),
+                "update_id": update_id,
+                "entry": entry,
+                "day_entries": [],
+                "students": students,
+            })
+
+        for slot in slots:
+            slot["day_entries"] = entries_by_date.get(slot["date"], [])
+
+        courses = {}
+        for slot in slots:
+            entry = slot["entry"]
+            course_key = "{}|{}|{}".format(
+                entry.get("subjectId"), entry.get("division") or "",
+                entry.get("batchGroupId") or entry.get("batch") or "",
+            )
+            course = courses.setdefault(course_key, {
+                "key": course_key,
+                "subjectId": entry.get("subjectId"),
+                "subject": entry.get("subject_full") or entry.get("sub_shortname")
+                           or f"Subject {entry.get('subjectId')}",
+                "division": entry.get("division") or "",
+                "batch": entry.get("batchGroupId") or entry.get("batch") or "",
+                "slots": [], "students": [], "matrix": {},
+            })
+            course["slots"].append(slot)
+            for student in slot["students"]:
+                admno = str(student.get("admno"))
+                if not admno:
+                    continue
+                if not any(item.get("admno") == admno for item in course["students"]):
+                    course["students"].append(student)
+                course["matrix"].setdefault(admno, {})[slot["slot_key"]] = bool(student.get("present"))
+
+        result_courses = []
+        for course in courses.values():
+            present = sum(value for row in course["matrix"].values() for value in row.values() if value)
+            total = sum(len(row) for row in course["matrix"].values())
+            course["slot_count"] = len(course["slots"])
+            course["stats"] = {"present": present, "absent": total - present}
+            course["slots"].sort(key=lambda item: (item["date"] or "", item["fromTime"] or ""))
+            result_courses.append(course)
+        return {
+            "date_range": {"from": date_from, "to": date_to},
+            "courses": result_courses,
+        }
+
+    def has_fresh_sync(self, empid, date_from, date_to):
+        with closing(self._connect()) as conn:
+            with conn.cursor() as cur:
+                cur.execute("""
+                    SELECT 1 FROM sync_runs
+                    WHERE empid = %s AND status = 'done'
+                      AND date_from <= %s AND date_to >= %s
+                """, (str(empid), date_from, date_to))
+                return cur.fetchone() is not None
+
+    def save_slot(self, empid, slot_key, entry, roster):
+        synced_at = datetime.now(timezone.utc)
+        from_date = entry.get("fromDate")
+        students = roster.get("students", [])
+        present = roster.get("present", set())
+        students_json = [
+            {**student, "present": student.get("admno") in present}
+            for student in students
+        ]
+        with self._lock, closing(self._connect()) as conn:
+            with conn.cursor() as cur:
+                cur.execute("""
+                    INSERT INTO timetable_entries (empid, slot_key, from_date, entry, synced_at)
+                    VALUES (%s, %s, %s, %s, %s)
+                    ON CONFLICT (empid, slot_key) DO UPDATE SET
+                        from_date = EXCLUDED.from_date, entry = EXCLUDED.entry,
+                        synced_at = EXCLUDED.synced_at
+                """, (str(empid), slot_key, from_date, self._jsonb(entry), synced_at))
+                cur.execute("""
+                    INSERT INTO roster_snapshots (empid, slot_key, update_id, taken, students, synced_at)
+                    VALUES (%s, %s, %s, %s, %s, %s)
+                    ON CONFLICT (empid, slot_key) DO UPDATE SET
+                        update_id = EXCLUDED.update_id, taken = EXCLUDED.taken,
+                        students = EXCLUDED.students, synced_at = EXCLUDED.synced_at
+                """, (str(empid), slot_key, roster.get("update_id"),
+                      bool(roster.get("taken")), self._jsonb(students_json), synced_at))
+                cur.execute("DELETE FROM attendance_records WHERE empid = %s AND slot_key = %s",
+                            (str(empid), slot_key))
+                cur.executemany("""
+                    INSERT INTO attendance_records
+                        (empid, slot_key, student_admno, present, update_id, class_date, synced_at)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s)
+                """, [(str(empid), slot_key, student["admno"],
+                        student["admno"] in present, roster.get("update_id"),
+                        from_date, synced_at) for student in students])
+            conn.commit()
+
+    def cached_slots(self, empid, slot_keys, max_age_seconds=None):
+        """Return previously stored roster data keyed by the exact slot key."""
+        if not slot_keys:
+            return {}
+        with closing(self._connect()) as conn:
+            with conn.cursor() as cur:
+                cur.execute("""
+                    SELECT t.slot_key, r.update_id, r.taken, r.students, r.synced_at
+                    FROM timetable_entries t
+                    JOIN roster_snapshots r
+                      ON r.empid = t.empid AND r.slot_key = t.slot_key
+                    WHERE t.empid = %s AND t.slot_key = ANY(%s)
+                """, (str(empid), list(slot_keys)))
+                rows = cur.fetchall()
+        result = {}
+        now = datetime.now(timezone.utc)
+        for slot_key, update_id, taken, students, synced_at in rows:
+            if max_age_seconds is not None:
+                age = (now - synced_at).total_seconds()
+                if age > max_age_seconds:
+                    continue
+            students = students or []
+            result[slot_key] = {
+                "taken": bool(taken),
+                "update_id": update_id,
+                "present": {
+                    str(student["admno"])
+                    for student in students
+                    if student.get("present")
+                },
+                "students": students,
+                "cached": True,
+                "synced_at": synced_at.isoformat(),
+            }
+        return result
+
+    def student_attendance(self, empid, student_admno, date_from=None, date_to=None):
+        query = """
+            SELECT a.slot_key, a.class_date, a.present, a.update_id, t.entry
+            FROM attendance_records a
+            JOIN timetable_entries t USING (empid, slot_key)
+            WHERE a.empid = %s AND a.student_admno = %s
+        """
+        params = [str(empid), student_admno]
+        if date_from:
+            query += " AND a.class_date >= %s"
+            params.append(date_from)
+        if date_to:
+            query += " AND a.class_date <= %s"
+            params.append(date_to)
+        query += " ORDER BY a.class_date DESC, t.entry->>'fromTime' DESC"
+        with closing(self._connect()) as conn:
+            with conn.cursor() as cur:
+                cur.execute(query, params)
+                rows = cur.fetchall()
+        return [{
+            "slot_key": row[0], "date": row[1].isoformat(),
+            "present": row[2], "update_id": row[3], "entry": row[4],
+        } for row in rows]
+
+
+mirror = MirrorStore() if DATABASE_URL else None

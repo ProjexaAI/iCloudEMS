@@ -15,6 +15,7 @@ Design:
   server data for those classes.
 """
 import time
+import csv
 import tkinter as tk
 from datetime import date, timedelta, datetime
 from tkinter import ttk, messagebox
@@ -33,6 +34,7 @@ class CoursesTab:
         self.poll_active = False
         self.poll_after_id = None
         self.dirty_slots = set()  # set of (course_key, slot_key)
+        self.failed_slots = []
         self._build()
 
     # ---------- build ----------
@@ -50,6 +52,24 @@ class CoursesTab:
         self.load_btn = ttk.Button(top, text="Load", style="Primary.TButton",
                                    command=self.on_load)
         self.load_btn.pack(side="left", padx=6)
+        self.sync_btn = ttk.Button(top, text="Sync now", style="Ghost.TButton",
+                                   command=self.on_sync)
+        self.sync_btn.pack(side="left", padx=2)
+        self.sync_subject_btn = ttk.Button(
+            top, text="Sync subject", style="Ghost.TButton",
+            command=self.on_sync_subject,
+        )
+        self.sync_subject_btn.pack(side="left", padx=2)
+        self.sync_day_btn = ttk.Button(
+            top, text="Sync day", style="Ghost.TButton",
+            command=self.on_sync_day,
+        )
+        self.sync_day_btn.pack(side="left", padx=2)
+        self.retry_btn = ttk.Button(
+            top, text="Retry failed", style="Ghost.TButton",
+            state="disabled", command=self.on_retry_failed,
+        )
+        self.retry_btn.pack(side="left", padx=2)
         self.progress_label = ttk.Label(top, text="", style="Muted.TLabel")
         self.progress_label.pack(side="left", padx=12)
 
@@ -90,6 +110,17 @@ class CoursesTab:
         ttk.Label(mid, text="Click a student to see their lectures.",
                   style="Muted.TLabel", font=("Segoe UI", 8, "italic")
                   ).pack(anchor="w", pady=(2, 6))
+        filter_row = ttk.Frame(mid, style="Card.TFrame")
+        filter_row.pack(fill="x", pady=(0, 4))
+        ttk.Label(filter_row, text="Search").pack(side="left")
+        self.student_filter_var = tk.StringVar()
+        self.student_filter_var.trace_add("write", lambda *_: self._refresh_student_tree())
+        ttk.Entry(filter_row, textvariable=self.student_filter_var, width=16).pack(side="left", padx=5)
+        self.absent_only_var = tk.BooleanVar(value=False)
+        ttk.Checkbutton(
+            filter_row, text="Below 75%", variable=self.absent_only_var,
+            command=self._refresh_student_tree,
+        ).pack(side="left")
 
         cols = ("rollno", "name", "pct")
         self.student_tree = ttk.Treeview(mid, columns=cols,
@@ -157,6 +188,12 @@ class CoursesTab:
                                      style="CardTitle.TLabel",
                                      font=("Segoe UI", 11, "bold"))
         self.att_summary.pack(anchor="w")
+        self.analytics_label = ttk.Label(right, text="", style="Muted.TLabel")
+        self.analytics_label.pack(anchor="w", pady=(4, 0))
+        ttk.Button(
+            right, text="Export subject CSV", style="Ghost.TButton",
+            command=self.export_subject_csv,
+        ).pack(anchor="w", pady=(4, 0))
 
     # ---------- state helpers ----------
 
@@ -170,6 +207,8 @@ class CoursesTab:
             self.poll_after_id = None
         self.courses = []
         self.course_by_key = {}
+        self.failed_slots = []
+        self.retry_btn.config(state="disabled")
         self.selected_course_key = None
         self.selected_student_admno = None
         self.dirty_slots.clear()
@@ -178,7 +217,50 @@ class CoursesTab:
         self.progress_label.config(text="")
         self.att_header.config(text="Select a student")
         self.att_summary.config(text="")
+        self.analytics_label.config(text="")
         self._update_action_buttons()
+
+    def _update_course_analytics(self):
+        course = self.course_by_key.get(self.selected_course_key)
+        if not course:
+            self.analytics_label.config(text="")
+            return
+        present, absent = self._course_totals(course)
+        total = present + absent
+        average = round(100 * present / total, 1) if total else 0
+        low_count = 0
+        for student in course.get("students", []):
+            row = course.get("matrix", {}).get(student["admno"], {})
+            count = len(row)
+            attended = sum(1 for value in row.values() if value)
+            if count and attended / count < 0.75:
+                low_count += 1
+        self.analytics_label.config(
+            text=f"Class average: {average}% · {low_count} students below 75%"
+        )
+
+    def export_subject_csv(self):
+        course = self.course_by_key.get(self.selected_course_key)
+        if not course:
+            messagebox.showinfo("Export", "Select a subject first.")
+            return
+        path = f"attendance_{course.get('subjectId') or 'subject'}.csv"
+        try:
+            with open(path, "w", newline="", encoding="utf-8") as output:
+                writer = csv.writer(output)
+                writer.writerow(["Admission number", "Roll number", "Name", "Present", "Total", "Percentage"])
+                for student in course.get("students", []):
+                    row = course.get("matrix", {}).get(student["admno"], {})
+                    present = sum(1 for value in row.values() if value)
+                    total = len(row)
+                    pct = round(100 * present / total, 1) if total else 0
+                    writer.writerow([
+                        student["admno"], student.get("rollno", ""),
+                        student.get("name", ""), present, total, pct,
+                    ])
+            self.app.set_status(f"Exported {path}")
+        except OSError as exc:
+            messagebox.showerror("Export failed", str(exc))
 
     def _slot_stats(self, course, sk):
         """Return (present_count, absent_count, total_count, is_taken) for a slot."""
@@ -230,7 +312,7 @@ class CoursesTab:
 
     # ---------- load + polling ----------
 
-    def on_load(self):
+    def on_load(self, force=False, subject_id=None, sync_day=None, slot_keys=None):
         if self.dirty_slots:
             confirm = messagebox.askyesno(
                 "Unsaved Changes",
@@ -255,7 +337,10 @@ class CoursesTab:
         self.app.set_status("Loading course history…")
 
         def do():
-            return self.app.api.load_courses(df, dt)
+            return self.app.api.load_courses(
+                df, dt, force=force, subject_id=subject_id,
+                sync_day=sync_day, slot_keys=slot_keys,
+            )
 
         def ok(data):
             self._start_polling(data["job_id"])
@@ -267,6 +352,65 @@ class CoursesTab:
                                  getattr(e, "message", None) or str(e))
 
         self.app.run_async(do, ok, err)
+
+    def on_sync_status(self):
+        """Show the mirror status, then let the user choose the next sync range."""
+        def do():
+            return self.app.api.sync_status()
+
+        def ok(data):
+            status = data.get("status", "never_synced")
+            done = data.get("slots_done", 0)
+            total = data.get("slots_total", 0)
+            if status == "running":
+                message = f"Sync in progress: {done}/{total} slots"
+            elif status == "done":
+                message = f"Last sync complete: {done}/{total} slots"
+            elif status == "error":
+                message = f"Last sync failed: {data.get('error') or 'unknown error'}"
+            else:
+                message = "No sync has completed yet."
+            self.progress_label.config(text=message)
+            self.app.set_status(message)
+            if message.startswith("No sync"):
+                self.on_load()
+
+        def err(e):
+            messagebox.showerror("Sync status failed",
+                                 getattr(e, "message", None) or str(e))
+
+        self.app.run_async(do, ok, err)
+
+    def on_sync(self):
+        """Run a fresh upstream sync for the selected date range."""
+        self.on_load(force=True)
+
+    def on_sync_subject(self):
+        """Refresh only the currently selected subject."""
+        if not self.selected_course_key:
+            messagebox.showinfo("Select a subject", "Select a subject before syncing it.")
+            return
+        course = self.course_by_key.get(self.selected_course_key)
+        if not course or course.get("subjectId") is None:
+            messagebox.showerror("Sync subject", "The selected subject has no subject ID.")
+            return
+        self.on_load(force=True, subject_id=str(course["subjectId"]))
+
+    def on_sync_day(self):
+        """Refresh only the selected calendar day in the current range."""
+        day = self.to_var.get().strip()
+        try:
+            datetime.strptime(day, "%Y-%m-%d")
+        except ValueError:
+            messagebox.showwarning("Invalid date", "Use YYYY-MM-DD for the sync day.")
+            return
+        self.on_load(force=True, sync_day=day)
+
+    def on_retry_failed(self):
+        if not self.failed_slots:
+            return
+        slot_keys = [slot["slot_key"] for slot in self.failed_slots]
+        self.on_load(force=True, slot_keys=slot_keys)
 
     def _start_polling(self, job_id):
         self.poll_active = True
@@ -316,6 +460,19 @@ class CoursesTab:
         self.app.run_async(do, ok, err)
 
     def _apply_result(self, result):
+        self.failed_slots = result.get("failed_slots", [])
+        self.retry_btn.config(
+            state="normal" if self.failed_slots else "disabled"
+        )
+        cached = result.get("cached_slots", 0)
+        fetched = result.get("fetched_slots", 0)
+        failed = len(self.failed_slots)
+        if failed:
+            self.progress_label.config(
+                text=f"Cached {cached} · fetched {fetched} · failed {failed}"
+            )
+        else:
+            self.progress_label.config(text=f"Cached {cached} · fetched {fetched}")
         self.courses = result.get("courses", [])
         self.courses.sort(key=lambda c: (c.get("subject") or "",
                                          c.get("division") or ""))
@@ -360,21 +517,39 @@ class CoursesTab:
         if not c:
             return
 
-        self.student_tree.delete(*self.student_tree.get_children())
-        for s in c.get("students", []):
-            row = c["matrix"].get(s["admno"], {})
-            p = sum(1 for v in row.values() if v)
-            t = len(row)
-            pct = round(100 * p / t) if t else 0
-            orig_row = c.get("orig_matrix", {}).get(s["admno"], {})
-            is_stu_dirty = any(row.get(sk) != orig_row.get(sk) for sk in row)
-            pct_str = f"{pct}% *" if is_stu_dirty else f"{pct}%"
-            self.student_tree.insert("", "end", iid=s["admno"],
-                                     values=(s["rollno"], s["name"], pct_str))
+        self.student_filter_var.set("")
+        self.absent_only_var.set(False)
+        self._refresh_student_tree()
 
         self.att_tree.delete(*self.att_tree.get_children())
         self.att_header.config(text="Select a student")
         self.att_summary.config(text="")
+        self._update_course_analytics()
+
+    def _refresh_student_tree(self):
+        c = self.course_by_key.get(self.selected_course_key)
+        if not c:
+            return
+        query = self.student_filter_var.get().strip().lower()
+        below_threshold = self.absent_only_var.get()
+        self.student_tree.delete(*self.student_tree.get_children())
+        for student in c.get("students", []):
+            row = c["matrix"].get(student["admno"], {})
+            present = sum(1 for value in row.values() if value)
+            total = len(row)
+            pct = round(100 * present / total) if total else 0
+            haystack = f"{student.get('rollno', '')} {student.get('name', '')} {student['admno']}".lower()
+            if query and query not in haystack:
+                continue
+            if below_threshold and pct >= 75:
+                continue
+            orig_row = c.get("orig_matrix", {}).get(student["admno"], {})
+            is_dirty = any(row.get(sk) != orig_row.get(sk) for sk in row)
+            pct_str = f"{pct}% *" if is_dirty else f"{pct}%"
+            self.student_tree.insert(
+                "", "end", iid=student["admno"],
+                values=(student["rollno"], student["name"], pct_str),
+            )
 
     def on_student_selected(self, _event=None):
         sel = self.student_tree.selection()
