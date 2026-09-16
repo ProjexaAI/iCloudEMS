@@ -11,8 +11,10 @@ from .config import DATABASE_URL, ENVIRONMENT, MAX_REQUESTS_PER_MINUTE, REDIS_UR
 from .logging_utils import _log
 from .routes import auth, timetable, attendance, courses
 from .runtime_state import runtime_state
+from .projexa_auth import projexa_auth_middleware
 
 app = FastAPI(title="iCloudEMS Server", version="0.2.0")
+app.middleware("http")(projexa_auth_middleware)
 
 app.include_router(auth.router,       prefix="/sessions", tags=["auth"])
 app.include_router(timetable.router,  prefix="/sessions", tags=["timetable"])

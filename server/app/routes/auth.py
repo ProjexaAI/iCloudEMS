@@ -1,4 +1,5 @@
 import time
+from fastapi import Request
 
 from fastapi import APIRouter, HTTPException
 
@@ -10,6 +11,7 @@ from ..schemas import (
 )
 from ..sessions import store
 from ..storage import create_token_store
+from ..projexa_auth import verify_projexa_token
 
 router = APIRouter()
 token_store = create_token_store()
@@ -48,6 +50,30 @@ def start_login(req: StartLoginRequest):
     return StartLoginResponse(
         session_id=sid, state="otp_sent",
         email=req.email, empid=None,
+    )
+
+
+@router.post("/token", response_model=StartLoginResponse)
+def start_from_projexa_token(request: Request):
+    """Create an iCloud session from an already authenticated Projexa user."""
+    authorization = request.headers.get("Authorization", "")
+    if not authorization.startswith("Bearer "):
+        raise HTTPException(401, "Projexa bearer token required")
+    claims = verify_projexa_token(authorization[7:].strip())
+    email = (claims.get("email") or "").strip().lower()
+    if not email:
+        raise HTTPException(400, "Projexa token has no email claim")
+    sid, client = store.create()
+    store.set_identity(sid, str(claims["sub"]))
+    store.set_email(sid, email)
+    client.contact = email
+    client._token_store = token_store
+    restored = client.load_from_store(token_store, email)
+    if not restored or not client.empid:
+        store.delete(sid)
+        raise HTTPException(409, "iCloudEMS account link required")
+    return StartLoginResponse(
+        session_id=sid, state="ready", email=email, empid=client.empid,
     )
 
 

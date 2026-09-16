@@ -32,6 +32,10 @@ SUBMIT_DUMP      = Path(os.getenv("ICLOUDEMS_SUBMIT_DUMP", str(Path.home() / "ic
 DATABASE_URL = os.getenv("DATABASE_URL", "")
 REDIS_URL = os.getenv("REDIS_URL", "")
 TOKEN_ENCRYPTION_KEY = os.getenv("TOKEN_ENCRYPTION_KEY", "")
+PROJEXA_AUTH_MODE = os.getenv("PROJEXA_AUTH_MODE", "local").strip().lower()
+PROJEXA_JWT_SECRET = os.getenv("PROJEXA_JWT_SECRET", "")
+PROJEXA_JWT_ISSUER = os.getenv("PROJEXA_JWT_ISSUER", "https://projexa.ai")
+PROJEXA_JWT_AUDIENCE = os.getenv("PROJEXA_JWT_AUDIENCE", "icloud.projexa.ai")
 ENVIRONMENT = os.getenv("ENVIRONMENT", "development").strip().lower()
 SERVER_HOST = os.getenv("SERVER_HOST", "127.0.0.1")
 SERVER_PORT = _env_int("SERVER_PORT", 8000, 1, 65535)
@@ -55,4 +59,7 @@ if ENVIRONMENT == "production" and DEBUG_MODE:
 
 if ENVIRONMENT == "production" and not TOKEN_ENCRYPTION_KEY:
 	raise ValueError("TOKEN_ENCRYPTION_KEY must be configured in production")
+
+if ENVIRONMENT == "production" and PROJEXA_AUTH_MODE == "projexa" and not PROJEXA_JWT_SECRET:
+	raise ValueError("PROJEXA_JWT_SECRET must be configured in production")
 

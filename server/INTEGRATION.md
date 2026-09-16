@@ -46,6 +46,24 @@ Do not commit `.env` or expose `TOKEN_ENCRYPTION_KEY`.
 
 Authentication is currently session-based and is expected to be replaced or wrapped by the platform authentication system later.
 
+When `PROJEXA_AUTH_MODE=projexa`, the mobile platform should first obtain a
+short-lived Projexa attendance token and call `POST /sessions/token` with:
+
+```http
+Authorization: Bearer <projexa-attendance-token>
+```
+
+The server maps the token email to the encrypted iCloudEMS account record.
+If no provider account has been linked yet, it returns `409` with
+`iCloudEMS account link required`; the platform should then run the provider
+linking flow rather than treating the Projexa login as an iCloudEMS login.
+
+The mobile app integration uses `src/api/icloudClient.js`. Configure its
+production base URL as `EXPO_PUBLIC_ICLOUD_API_URL=https://icloud.projexa.ai`.
+The Projexa session cookie remains used only for the SOET token exchange; the
+short-lived attendance token and iCloud session ID are stored in native secure
+storage.
+
 For the current integration:
 
 1. Create a session with the faculty email.

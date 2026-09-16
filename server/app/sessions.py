@@ -58,6 +58,17 @@ class SessionStore:
                 self._sessions[sid]["email"] = email
                 self._sessions[sid]["last_accessed"] = time.time()
 
+    def set_identity(self, sid: str, subject: str) -> None:
+        with self._lock:
+            if sid in self._sessions:
+                self._sessions[sid]["projexa_subject"] = subject
+                self._sessions[sid]["last_accessed"] = time.time()
+
+    def owns_identity(self, sid: str, subject: str) -> bool:
+        with self._lock:
+            rec = self._sessions.get(sid)
+            return bool(rec and rec.get("projexa_subject") == subject)
+
     def delete(self, sid: str) -> bool:
         with self._lock:
             return self._sessions.pop(sid, None) is not None
