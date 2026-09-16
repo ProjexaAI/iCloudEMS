@@ -51,9 +51,13 @@ class InMemoryRuntimeState:
         now = time.time()
         with self._lock:
             opened_at, failures = self._values.get("provider:" + key, (0, 0))
-            if opened_at and now - opened_at < cooldown_seconds:
-                return False
-            return failures < threshold
+            if failures >= threshold:
+                # Circuit is open – allow retry only after cooldown elapses
+                if opened_at and now - opened_at < cooldown_seconds:
+                    return False
+                # Cooldown elapsed – reset and allow the request through
+                self._values.pop("provider:" + key, None)
+            return True
 
     def record_provider_success(self, key):
         with self._lock:
@@ -92,11 +96,14 @@ class RedisRuntimeState:
         self._redis.setex("idempotency:" + key, ttl_seconds, json.dumps(value))
 
     def provider_available(self, key, threshold, cooldown_seconds):
-        opened_at = self._redis.get("provider:opened:" + key)
-        if opened_at and time.time() - float(opened_at) < cooldown_seconds:
-            return False
         failures = int(self._redis.get("provider:failures:" + key) or 0)
-        return failures < threshold
+        if failures >= threshold:
+            opened_at = self._redis.get("provider:opened:" + key)
+            if opened_at and time.time() - float(opened_at) < cooldown_seconds:
+                return False
+            # Cooldown elapsed – reset and allow the request through
+            self._redis.delete("provider:opened:" + key, "provider:failures:" + key)
+        return True
 
     def record_provider_success(self, key):
         self._redis.delete("provider:opened:" + key, "provider:failures:" + key)
