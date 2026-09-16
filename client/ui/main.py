@@ -281,6 +281,8 @@ class AttendanceApp:
                    command=lambda: self._set_all(False)).pack(side="left", padx=6)
         ttk.Button(stu_actions, text="Reload", style="Ghost.TButton",
                    command=self.on_load_attendance).pack(side="left", padx=6)
+        ttk.Button(stu_actions, text="Same as previous", style="Ghost.TButton",
+               command=self.on_copy_previous).pack(side="left", padx=6)
         self.submit_btn = ttk.Button(stu_actions, text="Submit Attendance",
                                      style="Primary.TButton",
                                      state="disabled",
@@ -645,6 +647,44 @@ class AttendanceApp:
             self.set_status("Submission failed.")
             messagebox.showerror("Submit error",
                                  getattr(e, "message", None) or str(e))
+
+        self.run_async(do, ok, err)
+
+    def on_copy_previous(self):
+        if not self.current_entry or not self.current_entries:
+            return
+        target = self.current_entry
+        same_subject = [
+            entry for entry in self.current_entries
+            if str(entry.get("subjectId")) == str(target.get("subjectId"))
+            and (entry.get("fromTime") or "") < (target.get("fromTime") or "")
+        ]
+        if not same_subject:
+            messagebox.showinfo("Same as previous", "No earlier class for this subject was found today.")
+            return
+        previous = sorted(same_subject, key=lambda item: item.get("fromTime") or "")[-1]
+        if not messagebox.askyesno(
+                "Same as previous class",
+                f"Copy attendance from {previous.get('fromTime', '')}–{previous.get('toTime', '')} "
+                f"to {target.get('fromTime', '')}–{target.get('toTime', '')}?"):
+            return
+        self.submit_btn.config(state="disabled", text="Copying…")
+        self.set_status("Copying previous attendance…")
+
+        def do():
+            return self.api.copy_previous_attendance(
+                previous, target, self.current_entries,
+                self.academicyear or target.get("acad_year", "2026-2027"),
+            )
+
+        def ok(_data):
+            self.submit_btn.config(state="normal", text="Submit Attendance")
+            self.set_status("Attendance copied — reloading to verify…")
+            self.on_load_attendance()
+
+        def err(error):
+            self.submit_btn.config(state="normal", text="Submit Attendance")
+            messagebox.showerror("Copy failed", getattr(error, "message", None) or str(error))
 
         self.run_async(do, ok, err)
 

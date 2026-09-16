@@ -158,6 +158,35 @@ class ServerClient:
             },
         )
 
+    def copy_previous_attendance(self, previous_entry, target_entry,
+                                 day_entries, academicyear="", force=False):
+        return self._post(
+            f"/sessions/{self.session_id}/attendance/copy-previous",
+            {
+                "previous_entry": previous_entry,
+                "target_entry": target_entry,
+                "day_entries": day_entries,
+                "academicyear": academicyear,
+                "force": force,
+            },
+        )
+
+    def student_summary(self, student_admno, date_from=None, date_to=None, threshold=75):
+        params = {"threshold": threshold}
+        if date_from:
+            params["date_from"] = date_from
+        if date_to:
+            params["date_to"] = date_to
+        return self._get(f"/sessions/{self.session_id}/students/{student_admno}/summary", params)
+
+    def low_attendance(self, date_from=None, date_to=None, threshold=75):
+        params = {"threshold": threshold}
+        if date_from:
+            params["date_from"] = date_from
+        if date_to:
+            params["date_to"] = date_to
+        return self._get(f"/sessions/{self.session_id}/attendance/low", params)
+
     # ---------- by-course flow (new) ----------
 
     def load_courses(self, date_from, date_to, force=False, subject_id=None,
@@ -177,8 +206,19 @@ class ServerClient:
     def job_status(self, job_id):
         return self._get(f"/sessions/{self.session_id}/jobs/{job_id}")
 
+    def cancel_job(self, job_id):
+        return self._post(f"/sessions/{self.session_id}/jobs/{job_id}/cancel")
+
     def sync_status(self):
         return self._get(f"/sessions/{self.session_id}/sync/status")
+
+    def subjects(self, date_from=None, date_to=None):
+        params = {}
+        if date_from:
+            params["date_from"] = date_from
+        if date_to:
+            params["date_to"] = date_to
+        return self._get(f"/sessions/{self.session_id}/subjects", params)
 
     def student_attendance(self, student_admno, date_from=None, date_to=None):
         params = {}

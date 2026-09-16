@@ -241,6 +241,38 @@ class MirrorStore:
             "courses": result_courses,
         }
 
+    def subjects(self, empid, date_from=None, date_to=None):
+        query = """
+            SELECT entry->>'subjectId' AS subject_id,
+                   COALESCE(entry->>'subject_full', entry->>'sub_shortname') AS subject,
+                   COALESCE(entry->>'division', '') AS division,
+                   COALESCE(entry->>'batchGroupId', entry->>'batch', '') AS batch,
+                   COUNT(*) AS slot_count,
+                   MAX(synced_at) AS last_synced
+            FROM timetable_entries
+            WHERE empid = %s
+        """
+        params = [str(empid)]
+        if date_from:
+            query += " AND from_date >= %s"
+            params.append(date_from)
+        if date_to:
+            query += " AND from_date <= %s"
+            params.append(date_to)
+        query += """
+            GROUP BY subject_id, subject, division, batch
+            ORDER BY subject, division, batch, subject_id
+        """
+        with closing(self._connect()) as conn:
+            with conn.cursor() as cur:
+                cur.execute(query, params)
+                rows = cur.fetchall()
+        return [{
+            "subject_id": row[0], "subject": row[1] or f"Subject {row[0]}",
+            "division": row[2], "batch": row[3], "slot_count": row[4],
+            "last_synced": row[5].isoformat() if row[5] else None,
+        } for row in rows]
+
     def has_fresh_sync(self, empid, date_from, date_to):
         with closing(self._connect()) as conn:
             with conn.cursor() as cur:
@@ -288,7 +320,8 @@ class MirrorStore:
                         from_date, synced_at) for student in students])
             conn.commit()
 
-    def cached_slots(self, empid, slot_keys, max_age_seconds=None):
+    def cached_slots(self, empid, slot_keys, max_age_seconds=None,
+                     max_age_by_slot=None):
         """Return previously stored roster data keyed by the exact slot key."""
         if not slot_keys:
             return {}
@@ -305,9 +338,10 @@ class MirrorStore:
         result = {}
         now = datetime.now(timezone.utc)
         for slot_key, update_id, taken, students, synced_at in rows:
-            if max_age_seconds is not None:
+            allowed_age = (max_age_by_slot or {}).get(slot_key, max_age_seconds)
+            if allowed_age is not None:
                 age = (now - synced_at).total_seconds()
-                if age > max_age_seconds:
+                if age > allowed_age:
                     continue
             students = students or []
             result[slot_key] = {
@@ -347,6 +381,79 @@ class MirrorStore:
             "slot_key": row[0], "date": row[1].isoformat(),
             "present": row[2], "update_id": row[3], "entry": row[4],
         } for row in rows]
+
+    def student_summary(self, empid, student_admno, date_from=None,
+                        date_to=None, threshold=75):
+        query = """
+            SELECT a.student_admno, t.entry->>'subjectId',
+                   COALESCE(t.entry->>'subject_full', t.entry->>'sub_shortname'),
+                   COUNT(*) AS total,
+                   COUNT(*) FILTER (WHERE a.present) AS present,
+                   MAX(a.synced_at)
+            FROM attendance_records a
+            JOIN timetable_entries t USING (empid, slot_key)
+            WHERE a.empid = %s AND a.student_admno = %s
+        """
+        params = [str(empid), student_admno]
+        if date_from:
+            query += " AND a.class_date >= %s"
+            params.append(date_from)
+        if date_to:
+            query += " AND a.class_date <= %s"
+            params.append(date_to)
+        query += " GROUP BY a.student_admno, 2, 3 ORDER BY 3, 2"
+        with closing(self._connect()) as conn:
+            with conn.cursor() as cur:
+                cur.execute(query, params)
+                rows = cur.fetchall()
+        result = []
+        for _, subject_id, subject, total, present, synced_at in rows:
+            percentage = round(100 * present / total, 1) if total else 0
+            result.append({
+                "subject_id": subject_id,
+                "subject": subject or f"Subject {subject_id}",
+                "present": present,
+                "total": total,
+                "absent": total - present,
+                "percentage": percentage,
+                "below_threshold": percentage < threshold,
+                "last_synced": synced_at.isoformat() if synced_at else None,
+            })
+        return result
+
+    def low_attendance(self, empid, date_from=None, date_to=None, threshold=75):
+        query = """
+            SELECT a.student_admno, t.entry->>'subjectId',
+                   COALESCE(t.entry->>'subject_full', t.entry->>'sub_shortname'),
+                   COUNT(*) AS total,
+                   COUNT(*) FILTER (WHERE a.present) AS present
+            FROM attendance_records a
+            JOIN timetable_entries t USING (empid, slot_key)
+            WHERE a.empid = %s
+        """
+        params = [str(empid)]
+        if date_from:
+            query += " AND a.class_date >= %s"
+            params.append(date_from)
+        if date_to:
+            query += " AND a.class_date <= %s"
+            params.append(date_to)
+        query += " GROUP BY 1, 2, 3 ORDER BY 5::float / NULLIF(4, 0), 3, 1"
+        with closing(self._connect()) as conn:
+            with conn.cursor() as cur:
+                cur.execute(query, params)
+                rows = cur.fetchall()
+        result = []
+        for student_admno, subject_id, subject, total, present in rows:
+            percentage = round(100 * present / total, 1) if total else 0
+            if percentage < threshold:
+                result.append({
+                    "student_admno": student_admno, "subject_id": subject_id,
+                    "subject": subject or f"Subject {subject_id}",
+                    "present": present, "total": total,
+                    "absent": total - present, "percentage": percentage,
+                })
+        return result
 
 
 mirror = MirrorStore() if DATABASE_URL else None

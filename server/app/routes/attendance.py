@@ -11,7 +11,7 @@ from ..logging_utils import _log
 from ..runtime_state import request_fingerprint, runtime_state
 from ..schemas import (
     RosterRequest, RosterResponse, StudentModel,
-    SubmitRequest, SubmitResponse,
+    SubmitRequest, SubmitResponse, CopyAttendanceRequest,
 )
 from ..sessions import store
 from . import get_client
@@ -79,5 +79,64 @@ def submit(sid: str, req: SubmitRequest):
     runtime_state.set_idempotency(
         f"{sid}:{key}",
         {"fingerprint": fingerprint, "response": response.model_dump()},
+    )
+    return response
+
+
+@router.post("/{sid}/attendance/copy-previous", response_model=SubmitResponse)
+def copy_previous_attendance(sid: str, req: CopyAttendanceRequest):
+    """Copy the previous same-subject class attendance into the target class."""
+    client = get_client(sid)
+    previous = req.previous_entry
+    target = req.target_entry
+    if str(previous.get("subjectId")) != str(target.get("subjectId")):
+        raise HTTPException(400, "previous and target classes must have the same subject")
+    if (previous.get("fromDate"), previous.get("fromTime")) >= (
+        target.get("fromDate"), target.get("fromTime"),
+    ):
+        raise HTTPException(400, "previous class must occur before target class")
+
+    previous_data = parse_roster(client._with_auto_refresh(
+        client.get_attendance_default, client.empid, previous,
+        build_tt_array_data(req.day_entries),
+    ))
+    target_data = parse_roster(client._with_auto_refresh(
+        client.get_attendance_default, client.empid, target,
+        build_tt_array_data(req.day_entries),
+    ))
+    previous_students, _, previous_taken = previous_data
+    target_students, target_update_id, target_taken = target_data
+    if not previous_taken or not previous_students:
+        raise HTTPException(400, "previous class has no usable attendance")
+    if not target_taken or not target_update_id:
+        raise HTTPException(400, "target class attendance has not been taken")
+
+    previous_present = {
+        student["admno"] for student in previous_students if student["present"]
+    }
+    all_admno = [student["admno"] for student in target_students]
+    present_admno = [admno for admno in all_admno if admno in previous_present]
+    key = req.idempotency_key or uuid4().hex
+    fingerprint = request_fingerprint(req.model_dump())
+    cached = runtime_state.get_idempotency(f"{sid}:{key}")
+    if cached:
+        if cached["fingerprint"] != fingerprint:
+            raise HTTPException(409, "idempotency key was reused with a different request")
+        return SubmitResponse(**cached["response"])
+    if len(all_admno) >= 10 and len(present_admno) <= 1 and not req.force:
+        raise HTTPException(400, "copy would mark almost the entire target class absent")
+
+    with runtime_state.lock(f"attendance:{sid}:{json.dumps(target, sort_keys=True)}"):
+        client._with_auto_refresh(
+            client.submit_attendance, client.empid, target, all_admno,
+            present_admno, req.academicyear or target.get("acad_year", ""),
+            target_update_id, force=req.force,
+        )
+    response = SubmitResponse(
+        ok=True, stored_present=len(present_admno),
+        stored_absent=len(all_admno) - len(present_admno),
+    )
+    runtime_state.set_idempotency(
+        f"{sid}:{key}", {"fingerprint": fingerprint, "response": response.model_dump()},
     )
     return response

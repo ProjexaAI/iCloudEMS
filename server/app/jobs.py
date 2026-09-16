@@ -48,6 +48,7 @@ class JobRegistry:
                 "progress": {"phase": "starting", "done": 0, "total": 0},
                 "result": None,
                 "error": None,
+                "cancel_requested": False,
             }
             self._progress_done[jid] = 0
         return jid
@@ -61,6 +62,20 @@ class JobRegistry:
                         self._progress_done[jid] = p["done"]
                         kwargs["progress"] = dict(p)
                 self._jobs[jid].update(kwargs)
+
+    def cancel(self, jid: str, owner_sid: str) -> bool:
+        with self._lock:
+            job = self._jobs.get(jid)
+            if not job or job["owner_sid"] != owner_sid:
+                return False
+            if job["status"] == "running":
+                job["cancel_requested"] = True
+                return True
+            return False
+
+    def is_cancel_requested(self, jid: str) -> bool:
+        with self._lock:
+            return bool(self._jobs.get(jid, {}).get("cancel_requested"))
 
     def get(self, jid: str, owner_sid: str) -> Optional[Dict[str, Any]]:
         with self._lock:

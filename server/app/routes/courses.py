@@ -22,11 +22,13 @@ import asyncio
 import concurrent.futures
 import threading
 from pathlib import Path
+from datetime import date
 from typing import Optional
 from fastapi import APIRouter, HTTPException
 
 from ..config import (
     ROSTER_FETCH_CONCURRENCY, ROSTER_CACHE_TTL_SECONDS,
+    ROSTER_CACHE_TTL_TODAY_SECONDS, ROSTER_CACHE_TTL_RECENT_SECONDS,
     DEFAULT_ACADEMIC_YEAR, DEBUG_MODE,
 )
 
@@ -173,6 +175,9 @@ async def _run_load_job_async(jid: str, client: ICloudEMSClient,
                               slot_keys: Optional[list] = None) -> None:
     """Async version: timetable fetched via sync paging, rosters parallelized."""
     try:
+        if jobs.is_cancel_requested(jid):
+            jobs.update(jid, status="cancelled")
+            return
         jobs.update(jid, progress={"phase": "timetable", "done": 0, "total": 1})
         tt = await client._with_auto_refresh_async(
             client.get_timetable_async, client.empid, date_from, date_to,
@@ -217,10 +222,21 @@ async def _run_load_job_async(jid: str, client: ICloudEMSClient,
         api_semaphore = asyncio.Semaphore(ROSTER_FETCH_CONCURRENCY)
         cached_slots = {}
         if mirror is not None and not force:
+            today = date.today()
+            max_age_by_slot = {}
+            for entry in all_entries:
+                entry_date = date.fromisoformat(entry["fromDate"])
+                if entry_date == today:
+                    ttl = ROSTER_CACHE_TTL_TODAY_SECONDS
+                elif (today - entry_date).days <= 7:
+                    ttl = ROSTER_CACHE_TTL_RECENT_SECONDS
+                else:
+                    ttl = ROSTER_CACHE_TTL_SECONDS
+                max_age_by_slot[_slot_key(entry)] = ttl
             cached_slots = await asyncio.to_thread(
                 mirror.cached_slots, client.empid,
                 [_slot_key(entry) for entry in all_entries],
-                ROSTER_CACHE_TTL_SECONDS,
+                ROSTER_CACHE_TTL_SECONDS, max_age_by_slot,
             )
             _log(f"[courses] reusing {len(cached_slots)} cached rosters; "
                  f"fetching {total - len(cached_slots)} missing rosters")
@@ -237,6 +253,8 @@ async def _run_load_job_async(jid: str, client: ICloudEMSClient,
 
         async def _fetch_one(e):
             nonlocal completed, fetched_count
+            if jobs.is_cancel_requested(jid):
+                return
             sk = _slot_key(e)
             day_entries = by_date.get(e.get("fromDate"), [])
             worker_client = client.clone()
@@ -284,6 +302,10 @@ async def _run_load_job_async(jid: str, client: ICloudEMSClient,
 
         _log(f"[courses] fetching {total} slot rosters with asyncio.gather (max {ROSTER_FETCH_CONCURRENCY} concurrent)...")
         await asyncio.gather(*[_fetch_one(e) for e in all_entries])
+
+        if jobs.is_cancel_requested(jid):
+            jobs.update(jid, status="cancelled")
+            return
 
         # Assemble per-course results.
         result_courses = []
@@ -442,6 +464,14 @@ def job_status(sid: str, jid: str):
     return j
 
 
+@router.post("/{sid}/jobs/{jid}/cancel")
+def cancel_job(sid: str, jid: str):
+    get_client(sid)
+    if not jobs.cancel(jid, owner_sid=sid):
+        raise HTTPException(404, "running job not found")
+    return {"ok": True, "status": "cancellation_requested"}
+
+
 @router.get("/{sid}/sync/status")
 def sync_status(sid: str):
     client = get_client(sid)
@@ -449,6 +479,19 @@ def sync_status(sid: str):
         raise HTTPException(503, "attendance mirror is not configured")
     return mirror.sync_status(client.empid) or {
         "status": "never_synced", "slots_total": 0, "slots_done": 0,
+    }
+
+
+@router.get("/{sid}/subjects")
+def subjects(sid: str, date_from: Optional[str] = None,
+             date_to: Optional[str] = None):
+    client = get_client(sid)
+    if mirror is None:
+        raise HTTPException(503, "attendance mirror is not configured")
+    return {
+        "date_from": date_from,
+        "date_to": date_to,
+        "subjects": mirror.subjects(client.empid, date_from, date_to),
     }
 
 
@@ -466,6 +509,38 @@ def student_attendance(sid: str, student_admno: str,
     except ValueError as exc:
         raise HTTPException(400, "invalid attendance date") from exc
     return {"student_admno": student_admno, "records": rows}
+
+
+@router.get("/{sid}/students/{student_admno}/summary")
+def student_summary(sid: str, student_admno: str,
+                    date_from: Optional[str] = None,
+                    date_to: Optional[str] = None,
+                    threshold: float = 75):
+    client = get_client(sid)
+    if mirror is None:
+        raise HTTPException(503, "attendance mirror is not configured")
+    if not 0 <= threshold <= 100:
+        raise HTTPException(400, "threshold must be between 0 and 100")
+    return {
+        "student_admno": student_admno,
+        "subjects": mirror.student_summary(
+            client.empid, student_admno, date_from, date_to, threshold,
+        ),
+    }
+
+
+@router.get("/{sid}/attendance/low")
+def low_attendance(sid: str, date_from: Optional[str] = None,
+                   date_to: Optional[str] = None, threshold: float = 75):
+    client = get_client(sid)
+    if mirror is None:
+        raise HTTPException(503, "attendance mirror is not configured")
+    if not 0 <= threshold <= 100:
+        raise HTTPException(400, "threshold must be between 0 and 100")
+    return {
+        "threshold": threshold,
+        "records": mirror.low_attendance(client.empid, date_from, date_to, threshold),
+    }
 
 
 @router.post("/{sid}/slots/state", response_model=SlotStateResponse)

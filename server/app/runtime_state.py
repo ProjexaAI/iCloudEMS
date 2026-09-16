@@ -47,6 +47,23 @@ class InMemoryRuntimeState:
         with self._lock:
             self._values["idempotency:" + key] = (time.time() + ttl_seconds, value)
 
+    def provider_available(self, key, threshold, cooldown_seconds):
+        now = time.time()
+        with self._lock:
+            opened_at, failures = self._values.get("provider:" + key, (0, 0))
+            if opened_at and now - opened_at < cooldown_seconds:
+                return False
+            return failures < threshold
+
+    def record_provider_success(self, key):
+        with self._lock:
+            self._values.pop("provider:" + key, None)
+
+    def record_provider_failure(self, key):
+        with self._lock:
+            opened_at, failures = self._values.get("provider:" + key, (0, 0))
+            self._values["provider:" + key] = (opened_at or time.time(), failures + 1)
+
 
 class RedisRuntimeState:
     def __init__(self, url):
@@ -73,6 +90,22 @@ class RedisRuntimeState:
 
     def set_idempotency(self, key, value, ttl_seconds=86400):
         self._redis.setex("idempotency:" + key, ttl_seconds, json.dumps(value))
+
+    def provider_available(self, key, threshold, cooldown_seconds):
+        opened_at = self._redis.get("provider:opened:" + key)
+        if opened_at and time.time() - float(opened_at) < cooldown_seconds:
+            return False
+        failures = int(self._redis.get("provider:failures:" + key) or 0)
+        return failures < threshold
+
+    def record_provider_success(self, key):
+        self._redis.delete("provider:opened:" + key, "provider:failures:" + key)
+
+    def record_provider_failure(self, key):
+        failures = self._redis.incr("provider:failures:" + key)
+        self._redis.expire("provider:failures:" + key, 3600)
+        if failures == 1:
+            self._redis.set("provider:opened:" + key, time.time(), ex=3600)
 
 
 def request_fingerprint(payload):

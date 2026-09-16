@@ -121,6 +121,15 @@ class SubmitResponse(StrictModel):
     stored_absent: int
 
 
+class CopyAttendanceRequest(StrictModel):
+    previous_entry: Dict[str, Any]
+    target_entry: Dict[str, Any]
+    day_entries: List[Dict[str, Any]] = Field(min_length=1, max_length=MAX_DAY_ENTRIES)
+    academicyear: str = Field(default="", max_length=32)
+    idempotency_key: Optional[str] = Field(default=None, min_length=8, max_length=128)
+    force: bool = False
+
+
 # ---------------------------------------------------------------------------
 # Course-history view (new)
 # ---------------------------------------------------------------------------
