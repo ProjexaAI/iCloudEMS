@@ -301,7 +301,7 @@ async function send() {
     }
 
     let displayBody = data.body_json != null ? JSON.stringify(data.body_json, null, 2) : data.body;
-    if data.resolved_to {
+    if (data.resolved_to) {
       displayBody = `Resolved to: ${data.resolved_to.join(', ')}\n\n` + displayBody;
     }
     if (data.proxy_used) {
