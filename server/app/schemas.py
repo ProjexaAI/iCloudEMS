@@ -144,6 +144,13 @@ class CoursesLoadRequest(StrictModel):
     sync_day: Optional[date] = None
     slot_keys: Optional[List[str]] = Field(default=None, max_length=100)
 
+    @field_validator("force", mode="before")
+    @classmethod
+    def coerce_force(cls, v):
+        if isinstance(v, str):
+            return v.strip().lower() in {"true", "1", "yes"}
+        return bool(v)
+
     @model_validator(mode="after")
     def validate_range(self):
         if self.date_to < self.date_from:
