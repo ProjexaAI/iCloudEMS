@@ -4,11 +4,11 @@ Gated behind a simple env-var flag so it cannot accidentally be exposed
 in production.  Set ``ENABLE_TEST_PROXY=1`` to enable.
 """
 import asyncio
-import json
 import os
+import socket
 import time
 
-from curl_cffi import requests as cffi_requests
+from curl_cffi import requests as cffi_requests, CurlOpt
 from fastapi import APIRouter, Request
 from fastapi.responses import HTMLResponse, JSONResponse
 
@@ -35,6 +35,7 @@ async def proxy_forward(request: Request):
     raw_headers = body.get("headers") or {}
     payload = body.get("body")
     timeout_s = body.get("timeout", 30)
+    use_resolve = body.get("resolve", False)
 
     if not url:
         return JSONResponse(400, {"error": "url is required"})
@@ -45,7 +46,24 @@ async def proxy_forward(request: Request):
             headers[k] = v
 
     t0 = time.monotonic()
-    kwargs = {"headers": headers, "timeout": timeout_s, "impersonate": "chrome"}
+    session = cffi_requests.Session(impersonate="chrome")
+    kwargs = {"headers": headers, "timeout": timeout_s}
+
+    if use_resolve:
+        from urllib.parse import urlparse
+        parsed = urlparse(url)
+        hostname = parsed.hostname
+        port = parsed.port or (443 if parsed.scheme == "https" else 80)
+        try:
+            results = socket.getaddrinfo(hostname, port, socket.AF_UNSPEC, socket.SOCK_STREAM)
+            ips = list({r[4][0] for r in results})
+            if ips:
+                resolve_entries = [f"{hostname}:{port}:{ip}" for ip in ips]
+                session.curl.setopt(CurlOpt.RESOLVE, resolve_entries)
+                kwargs["_resolved_ips"] = ips
+        except Exception:
+            pass
+
     if method in ("POST", "PUT", "PATCH"):
         ct = headers.get("Content-Type", headers.get("content-type", ""))
         if "json" in ct:
@@ -53,8 +71,10 @@ async def proxy_forward(request: Request):
         elif payload:
             kwargs["data"] = payload.encode() if isinstance(payload, str) else payload
 
-    resp = await asyncio.to_thread(cffi_requests.request, method, url, **kwargs)
+    resolved_info = kwargs.pop("_resolved_ips", None)
+    resp = await asyncio.to_thread(session.request, method, url, **kwargs)
     elapsed = time.monotonic() - t0
+    await asyncio.to_thread(session.close)
 
     resp_headers = dict(resp.headers)
     resp_body = resp.text
@@ -64,13 +84,16 @@ async def proxy_forward(request: Request):
     except Exception:
         resp_json = None
 
-    return {
+    result = {
         "status": resp.status_code,
         "elapsed_ms": round(elapsed * 1000),
         "headers": resp_headers,
         "body": resp_body,
         "body_json": resp_json,
     }
+    if resolved_info:
+        result["resolved_to"] = resolved_info
+    return result
 
 
 _HTML = r"""<!DOCTYPE html>
@@ -179,6 +202,9 @@ _HTML = r"""<!DOCTYPE html>
   <label style="font-size:12px; margin-left:16px">Timeout:
     <input type="number" id="timeout" value="30" style="width:60px">s
   </label>
+  <label style="font-size:12px; margin-left:16px; color:#58a6ff; font-weight:600">
+    <input type="checkbox" id="resolve"> DNS Resolve bypass
+  </label>
 </div>
 
 <div id="response-box" style="display:none">
@@ -221,6 +247,7 @@ async function send() {
     body: null,
     follow_redirects: document.getElementById('follow').checked,
     timeout: parseInt(document.getElementById('timeout').value) || 30,
+    resolve: document.getElementById('resolve').checked,
   };
 
   const bodyText = document.getElementById('body').value.trim();
@@ -263,6 +290,9 @@ async function send() {
     }
 
     let displayBody = data.body_json != null ? JSON.stringify(data.body_json, null, 2) : data.body;
+    if (data.resolved_to) {
+      displayBody = `Resolved to: ${data.resolved_to.join(', ')}\n\n` + displayBody;
+    }
     rbo.textContent = displayBody || '(empty)';
   } catch (e) {
     rb.style.display = 'block';
