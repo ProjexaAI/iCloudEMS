@@ -887,9 +887,9 @@ class ICloudEMSClient:
         try:
             return await fn(*args, **kwargs)
         except HTTPError as e:
-            if e.status != 401:
+            if e.status not in (401, 403):
                 raise
-            self._log("got 401, attempting refresh…")
+            self._log(f"got {e.status}, attempting refresh…")
             try:
                 with _refresh_lock:
                     self.refresh()

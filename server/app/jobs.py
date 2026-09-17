@@ -63,6 +63,19 @@ class JobRegistry:
                         kwargs["progress"] = dict(p)
                 self._jobs[jid].update(kwargs)
 
+    def increment_progress(self, jid: str, phase: str, total: int) -> tuple:
+        """Atomically increment progress.done and return (done, total, all_done)."""
+        with self._lock:
+            job = self._jobs.get(jid)
+            if not job:
+                return None
+            prev = job.get("progress", {})
+            done = prev.get("done", 0) + 1
+            effective_total = total if total > 0 else prev.get("total", 0)
+            job["progress"] = {"phase": phase, "done": done, "total": effective_total}
+            self._progress_done[jid] = done
+            return done, effective_total, done >= effective_total
+
     def cancel(self, jid: str, owner_sid: str) -> bool:
         with self._lock:
             job = self._jobs.get(jid)

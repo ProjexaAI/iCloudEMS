@@ -426,16 +426,19 @@ def _run_load_job_thread(jid: str, client: ICloudEMSClient,
 
 # ---------- routes ----------
 
-@router.post("/{sid}/courses/load", response_model=CoursesLoadResponse)
+@router.post("/{sid}/courses/load")
 def load_courses(sid: str, req: CoursesLoadRequest):
-    """Return cached course data from the mirror.
+    """Return relay proxy tasks for the mobile app to fetch course data.
 
-    The server cannot fetch from iCloudEMS directly — data must be
-    populated by the mobile app via timetable/roster proxy endpoints.
+    Instead of making server-side calls to iCloudEMS (which are blocked by
+    WAF), we return proxy instructions that the mobile app executes using
+    its trusted residential IP, then posts results back via /proxy/ingest.
     """
     client = get_client(sid)
     date_from = req.date_from.isoformat()
     date_to = req.date_to.isoformat()
+
+    # Check mirror cache first
     if mirror is not None and not req.force:
         try:
             if mirror.has_fresh_sync(client.empid, date_from, date_to):
@@ -444,22 +447,36 @@ def load_courses(sid: str, req: CoursesLoadRequest):
                     jid = jobs.create(owner_sid=sid)
                     jobs.update(jid, status="done", result=cached,
                                 progress={"phase": "cached", "done": 1, "total": 1})
-                    return CoursesLoadResponse(job_id=jid)
+                    return {"job_id": jid}
         except Exception as ex:
             _log(f"[courses] cache read failed: {ex!r}")
 
-    # No cached data — start a background sync job
+    # Create a job to track relay progress
     jid = jobs.create(owner_sid=sid)
-    jobs.update(jid, status="running", progress={"phase": "starting", "done": 0, "total": 1})
-    _log(f"[courses] no cache for empid={client.empid} {date_from}..{date_to}, starting background sync job {jid}")
-    t = threading.Thread(
-        target=_run_load_job_thread,
-        args=(jid, client.clone(), date_from, date_to),
-        kwargs={"force": req.force, "subject_id": req.subject_id},
-        daemon=True,
-    )
-    t.start()
-    return CoursesLoadResponse(job_id=jid)
+
+    # Generate timetable proxy tasks (week-by-week)
+    tt_tasks = client.build_proxy_timetable_tasks(client.empid, date_from, date_to)
+    for i, t in enumerate(tt_tasks):
+        t["meta"] = {
+            "route": "courses_timetable",
+            "job_id": jid,
+            "date_from": date_from,
+            "date_to": date_to,
+            "force": req.force,
+            "subject_id": req.subject_id,
+            "sync_day": req.sync_day,
+            "slot_keys": req.slot_keys,
+            "task_index": i,
+            "total_tasks": len(tt_tasks),
+        }
+
+    jobs.update(jid, progress={"phase": "timetable", "done": 0, "total": len(tt_tasks)})
+
+    _log(f"[courses] returning {len(tt_tasks)} timetable relay tasks for {date_from}..{date_to}")
+
+    if len(tt_tasks) == 1:
+        return {"proxy_required": True, **tt_tasks[0]}
+    return {"proxy_required": True, "tasks": tt_tasks, "meta": tt_tasks[0].get("meta", {})}
 
 
 @router.get("/{sid}/jobs/{jid}")
