@@ -1,4 +1,4 @@
-"""Attendance routes — roster and submit, always returns proxy instructions."""
+"""Attendance routes — roster and submit, fetches directly from iCloudEMS."""
 from datetime import date as dt_date
 from uuid import uuid4
 
@@ -15,7 +15,7 @@ from ..logging_utils import _log
 from ..mirror import mirror
 from ..runtime_state import request_fingerprint, runtime_state
 from ..schemas import (
-    ProxyInstruction, RosterRequest, RosterResponse, StudentModel,
+    RosterRequest, RosterResponse, StudentModel,
     SubmitRequest, SubmitResponse,
 )
 from ..storage import create_token_store
@@ -37,7 +37,7 @@ def _slot_key(e: dict) -> str:
 
 @router.post("/{sid}/roster")
 def roster(sid: str, req: RosterRequest) -> dict:
-    """Return proxy instruction for the mobile app to fetch a slot's roster."""
+    """Fetch a slot's roster directly from iCloudEMS."""
     client = get_client(sid)
     empid = client.empid
     sk = _slot_key(req.entry)
@@ -65,17 +65,38 @@ def roster(sid: str, req: RosterRequest) -> dict:
                 taken_flag=c["taken"],
             ).model_dump()
 
-    # 2. Return proxy instruction
+    # 2. Fetch directly from iCloudEMS
+    _log(f"[roster] fetching from iCloudEMS for slot {sk}")
     tt_array = build_tt_array_data(req.day_entries)
-    task = client.build_proxy_roster(empid, req.entry, tt_array)
-    task["meta"] = {"route": "roster", "entry": req.entry, "day_entries": req.day_entries}
-    _log(f"[roster] proxy instruction for slot {sk}")
-    return ProxyInstruction(**task).model_dump()
+    raw = client._with_auto_refresh(
+        client.get_attendance_default, empid, req.entry, tt_array,
+    )
+
+    students, update_id, taken_flag = parse_roster(raw)
+
+    # Save to mirror
+    if mirror is not None and empid:
+        try:
+            mirror.save_slot(empid, sk, req.entry, {
+                "students": students,
+                "present": {s["admno"] for s in students if s["present"]},
+                "update_id": update_id,
+                "taken": taken_flag,
+            })
+        except Exception as err:
+            _log(f"[roster] mirror write error: {err}")
+
+    _log(f"[roster] got {len(students)} students for slot {sk}")
+    return RosterResponse(
+        students=[StudentModel(**s) for s in students],
+        update_id=str(update_id) if update_id not in (None, "", 0) else None,
+        taken_flag=taken_flag,
+    ).model_dump()
 
 
 @router.post("/{sid}/submit")
 def submit(sid: str, req: SubmitRequest) -> dict:
-    """Return proxy instruction for the mobile app to submit attendance."""
+    """Submit attendance directly to iCloudEMS."""
     client = get_client(sid)
 
     key = req.idempotency_key or uuid4().hex
@@ -97,20 +118,37 @@ def submit(sid: str, req: SubmitRequest) -> dict:
             f"out of {len(req.all_admno)} are present. Pass force=True if intentional.",
         )
 
-    task = client.build_proxy_submit(
+    # Submit directly to iCloudEMS
+    _log(f"[submit] submitting to iCloudEMS for key={key}")
+    client._with_auto_refresh(
+        client.submit_attendance,
         client.empid, req.entry, req.all_admno, req.present_admno,
-        req.academicyear, req.update_id, idempotency_key=key,
+        req.academicyear, req.update_id, force=req.force,
     )
-    _log(f"[submit] proxy instruction for key={key}")
-    return ProxyInstruction(**task).model_dump()
 
-
-@router.post("/{sid}/submit/ingest")
-def ingest_submit(sid: str, req: SubmitRequest) -> dict:
-    """Ingest endpoint for submit proxy — stores result after mobile executes."""
-    client = get_client(sid)
-    key = req.idempotency_key or uuid4().hex
-    fingerprint = request_fingerprint(req.model_dump())
+    # Re-fetch roster from iCloudEMS to get the updated state and refresh mirror
+    fresh_students = []
+    fresh_update_id = None
+    fresh_taken = False
+    try:
+        tt_array = build_tt_array_data(req.day_entries)
+        raw = client._with_auto_refresh(
+            client.get_attendance_default, client.empid, req.entry, tt_array,
+        )
+        fresh_students, fresh_update_id, fresh_taken = parse_roster(raw)
+        sk = _slot_key(req.entry)
+        if mirror is not None and client.empid:
+            try:
+                mirror.save_slot(client.empid, sk, req.entry, {
+                    "students": fresh_students,
+                    "present": {s["admno"] for s in fresh_students if s["present"]},
+                    "update_id": fresh_update_id,
+                    "taken": fresh_taken,
+                })
+            except Exception as err:
+                _log(f"[submit] mirror write error: {err}")
+    except Exception as err:
+        _log(f"[submit] post-submit roster refetch failed: {err}")
 
     present = len(req.present_admno)
     absent = len(req.all_admno) - present
@@ -121,34 +159,12 @@ def ingest_submit(sid: str, req: SubmitRequest) -> dict:
         {"fingerprint": fingerprint, "response": response.model_dump()},
     )
 
-    return response.model_dump()
-
-
-@router.post("/{sid}/roster/ingest")
-def ingest_roster(sid: str, entry: dict, raw_data: dict) -> dict:
-    """Ingest endpoint for roster proxy — parses and stores result."""
-    client = get_client(sid)
-    empid = client.empid
-    sk = _slot_key(entry)
-
-    students, update_id, taken_flag = parse_roster(raw_data)
-
-    if mirror is not None and empid:
-        try:
-            mirror.save_slot(empid, sk, entry, {
-                "students": students,
-                "present": {s["admno"] for s in students if s["present"]},
-                "update_id": update_id,
-                "taken": taken_flag,
-            })
-        except Exception as err:
-            _log(f"[roster/ingest] mirror write error: {err}")
-
-    return RosterResponse(
-        students=[StudentModel(**s) for s in students],
-        update_id=str(update_id) if update_id not in (None, "", 0) else None,
-        taken_flag=taken_flag,
-    ).model_dump()
+    return {
+        **response.model_dump(),
+        "students": [{"rollno": s["rollno"], "admno": s["admno"], "name": s["name"], "present": s["present"], "known": s["known"]} for s in fresh_students],
+        "update_id": str(fresh_update_id) if fresh_update_id not in (None, "", 0) else None,
+        "taken_flag": fresh_taken,
+    }
 
 
 @router.post("/{sid}/attendance/copy-previous")
@@ -162,17 +178,50 @@ def copy_previous_attendance(sid: str, req: dict):
     if str(previous.get("subjectId")) != str(target.get("subjectId")):
         raise HTTPException(400, "previous and target must have the same subject")
 
-    # Return proxy instructions for both roster fetches
+    # Fetch both rosters directly from iCloudEMS
     tt_array = build_tt_array_data(day_entries)
-    prev_task = client.build_proxy_roster(client.empid, previous, tt_array)
-    prev_task["meta"] = {"route": "roster", "entry": previous, "day_entries": day_entries}
-    target_task = client.build_proxy_roster(client.empid, target, tt_array)
-    target_task["meta"] = {"route": "roster", "entry": target, "day_entries": day_entries}
+
+    # Fetch previous roster
+    raw_prev = client._with_auto_refresh(
+        client.get_attendance_default, client.empid, previous, tt_array,
+    )
+    prev_students, prev_update_id, prev_taken = parse_roster(raw_prev)
+
+    # Fetch target roster
+    raw_target = client._with_auto_refresh(
+        client.get_attendance_default, client.empid, target, tt_array,
+    )
+    target_students, target_update_id, target_taken = parse_roster(raw_target)
+
+    # Save both to mirror
+    if mirror is not None and client.empid:
+        prev_sk = _slot_key(previous)
+        target_sk = _slot_key(target)
+        try:
+            mirror.save_slot(client.empid, prev_sk, previous, {
+                "students": prev_students,
+                "present": {s["admno"] for s in prev_students if s["present"]},
+                "update_id": prev_update_id,
+                "taken": prev_taken,
+            })
+            mirror.save_slot(client.empid, target_sk, target, {
+                "students": target_students,
+                "present": {s["admno"] for s in target_students if s["present"]},
+                "update_id": target_update_id,
+                "taken": target_taken,
+            })
+        except Exception as err:
+            _log(f"[copy-previous] mirror write error: {err}")
 
     return {
-        "proxy_required": True,
-        "steps": [
-            {"label": "fetch_previous", **prev_task},
-            {"label": "fetch_target", **target_task},
-        ],
+        "previous": {
+            "students": [{"rollno": s["rollno"], "admno": s["admno"], "name": s["name"], "present": s["present"], "known": s["known"]} for s in prev_students],
+            "update_id": str(prev_update_id) if prev_update_id not in (None, "", 0) else None,
+            "taken_flag": prev_taken,
+        },
+        "target": {
+            "students": [{"rollno": s["rollno"], "admno": s["admno"], "name": s["name"], "present": s["present"], "known": s["known"]} for s in target_students],
+            "update_id": str(target_update_id) if target_update_id not in (None, "", 0) else None,
+            "taken_flag": target_taken,
+        },
     }

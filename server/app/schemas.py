@@ -222,27 +222,25 @@ class BatchSlotUpdateResponse(StrictModel):
 
 
 # ---------------------------------------------------------------------------
-# Mobile-as-Proxy schemas
+# Single-student bulk toggle
 # ---------------------------------------------------------------------------
 
-class ProxyInstruction(BaseModel):
-    """What the server returns to the mobile app — tells it what to fetch."""
-    proxy_required: bool = True
-    method: str                        # "GET" | "POST" | "POST_MULTIPART"
-    url: str
-    headers: Dict[str, str] = Field(default_factory=dict)
-    json_body: Optional[Dict[str, Any]] = None
-    form_data: Optional[Dict[str, str]] = None
-    meta: Optional[Dict[str, Any]] = None
-
-    model_config = ConfigDict(extra="forbid")
+class StudentSlotToggle(StrictModel):
+    entry: Dict[str, Any]
+    day_entries: List[Dict[str, Any]] = Field(min_length=1, max_length=MAX_DAY_ENTRIES)
+    present: bool
+    expected_update_id: Optional[str] = None
 
 
-class ProxyIngestRequest(BaseModel):
-    """What the mobile app sends back after executing the request."""
-    route: str                         # "timetable" | "roster" | "submit"
-    status_code: int
-    body: Any
-    meta: Optional[Dict[str, Any]] = None
+class StudentBulkToggleRequest(StrictModel):
+    student_admno: str = Field(min_length=1, max_length=128)
+    toggles: List[StudentSlotToggle] = Field(min_length=1, max_length=MAX_BATCH_UPDATES)
+
+
+class StudentBulkToggleResponse(StrictModel):
+    results: List[SlotUpdateResult]
+
+
+
 
 

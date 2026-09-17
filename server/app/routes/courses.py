@@ -46,6 +46,7 @@ from ..schemas import (
     SlotStateRequest, SlotStateResponse,
     SlotUpdateRequest, SlotUpdateResult,
     BatchSlotUpdateRequest, BatchSlotUpdateResponse,
+    StudentBulkToggleRequest, StudentBulkToggleResponse,
 )
 from ..sessions import store
 from . import get_client
@@ -428,12 +429,7 @@ def _run_load_job_thread(jid: str, client: ICloudEMSClient,
 
 @router.post("/{sid}/courses/load")
 def load_courses(sid: str, req: CoursesLoadRequest):
-    """Return relay proxy tasks for the mobile app to fetch course data.
-
-    Instead of making server-side calls to iCloudEMS (which are blocked by
-    WAF), we return proxy instructions that the mobile app executes using
-    its trusted residential IP, then posts results back via /proxy/ingest.
-    """
+    """Start a background job to fetch course data directly from iCloudEMS."""
     client = get_client(sid)
     date_from = req.date_from.isoformat()
     date_to = req.date_to.isoformat()
@@ -451,32 +447,22 @@ def load_courses(sid: str, req: CoursesLoadRequest):
         except Exception as ex:
             _log(f"[courses] cache read failed: {ex!r}")
 
-    # Create a job to track relay progress
+    # Create a job to track progress
     jid = jobs.create(owner_sid=sid)
 
-    # Generate timetable proxy tasks (week-by-week)
-    tt_tasks = client.build_proxy_timetable_tasks(client.empid, date_from, date_to)
-    for i, t in enumerate(tt_tasks):
-        t["meta"] = {
-            "route": "courses_timetable",
-            "job_id": jid,
-            "date_from": date_from,
-            "date_to": date_to,
-            "force": req.force,
-            "subject_id": req.subject_id,
-            "sync_day": req.sync_day,
-            "slot_keys": req.slot_keys,
-            "task_index": i,
-            "total_tasks": len(tt_tasks),
-        }
+    # Start background thread to fetch directly from iCloudEMS
+    worker = client.clone()
+    t = threading.Thread(
+        target=_run_load_job_thread,
+        args=(jid, worker, date_from, date_to, req.force, req.subject_id,
+              req.sync_day.isoformat() if req.sync_day else None,
+              req.slot_keys),
+        daemon=True,
+    )
+    t.start()
 
-    jobs.update(jid, progress={"phase": "timetable", "done": 0, "total": len(tt_tasks)})
-
-    _log(f"[courses] returning {len(tt_tasks)} timetable relay tasks for {date_from}..{date_to}")
-
-    if len(tt_tasks) == 1:
-        return {"proxy_required": True, **tt_tasks[0]}
-    return {"proxy_required": True, "tasks": tt_tasks, "meta": tt_tasks[0].get("meta", {})}
+    _log(f"[courses] started background job {jid} for {date_from}..{date_to}")
+    return {"job_id": jid}
 
 
 @router.get("/{sid}/jobs/{jid}")
@@ -644,6 +630,13 @@ def toggle_slot(sid: str, req: SlotToggleRequest):
     try:
         sd2 = _fetch_slot(clone, req.entry, req.day_entries)
         new_uid = sd2["update_id"]
+
+        # Persist updated roster to mirror
+        if mirror is not None and "error" not in sd2:
+            try:
+                mirror.save_slot(client.empid, _slot_key(req.entry), req.entry, sd2)
+            except Exception as mirror_err:
+                _log(f"[toggle] mirror write failed: {mirror_err!r}")
     except Exception as ex:
         _log(f"[toggle] post-submit refetch failed: {ex!r}")
 
@@ -687,8 +680,6 @@ async def batch_update_slots(sid: str, req: BatchSlotUpdateRequest):
             all_admno = [s["admno"] for s in sd["students"]]
             academicyear = item.entry.get("acad_year") or DEFAULT_ACADEMIC_YEAR
 
-            # The provider requires requests.Session for this multipart call,
-            # so run it in a bounded worker thread instead of blocking asyncio.
             await _submit_slot_async(
                 clone, item.entry, all_admno, list(item.present_admno),
                 academicyear, sd["update_id"], item.force, api_semaphore,
@@ -697,6 +688,16 @@ async def batch_update_slots(sid: str, req: BatchSlotUpdateRequest):
             sd2 = await _fetch_slot_async(
                 clone, item.entry, item.day_entries, api_semaphore,
             )
+
+            # Persist updated roster to mirror
+            if mirror is not None and "error" not in sd2:
+                try:
+                    await asyncio.to_thread(
+                        mirror.save_slot, client.empid, sk, item.entry, sd2,
+                    )
+                except Exception as mirror_err:
+                    _log(f"[batch_update] mirror write failed {sk}: {mirror_err!r}")
+
             return SlotUpdateResult(
                 slot_key=sk, ok=True,
                 new_update_id=sd2["update_id"],
@@ -713,3 +714,87 @@ async def batch_update_slots(sid: str, req: BatchSlotUpdateRequest):
         return_exceptions=False,
     )
     return BatchSlotUpdateResponse(results=list(results))
+
+
+@router.post("/{sid}/students/{student_admno}/bulk-toggle",
+             response_model=StudentBulkToggleResponse)
+async def student_bulk_toggle(sid: str, student_admno: str,
+                              req: StudentBulkToggleRequest):
+    """Toggle a single student's presence across multiple slots.
+
+    The server fetches each slot's current roster, applies the toggle
+    for the given student, and submits — all server-side. The client
+    just sends which slots to toggle and the desired state.
+    """
+    if req.student_admno != student_admno:
+        raise HTTPException(400, "student_admno in path and body must match")
+
+    client = get_client(sid)
+    api_semaphore = asyncio.Semaphore(ROSTER_FETCH_CONCURRENCY)
+
+    async def _process_one(toggle: StudentSlotToggle):
+        clone = client.clone()
+        sk = _slot_key(toggle.entry)
+        try:
+            sd = await _fetch_slot_async(
+                clone, toggle.entry, toggle.day_entries, api_semaphore,
+            )
+            current_uid = sd["update_id"] or "0"
+            expected_uid = toggle.expected_update_id or "0"
+
+            if not sd["taken"] or current_uid in (None, "0", 0):
+                return SlotUpdateResult(
+                    slot_key=sk, ok=False,
+                    error="Cannot update an untaken lecture.",
+                )
+
+            if current_uid != expected_uid:
+                return SlotUpdateResult(
+                    slot_key=sk, ok=False,
+                    error=f"Conflict: Slot was modified (current updateId={current_uid}, expected={expected_uid}).",
+                )
+
+            # Build the full present set by toggling this student
+            new_present = set(sd["present"])
+            if toggle.present:
+                new_present.add(student_admno)
+            else:
+                new_present.discard(student_admno)
+
+            all_admno = [s["admno"] for s in sd["students"]]
+            academicyear = toggle.entry.get("acad_year") or DEFAULT_ACADEMIC_YEAR
+
+            await _submit_slot_async(
+                clone, toggle.entry, all_admno, list(new_present),
+                academicyear, sd["update_id"], False, api_semaphore,
+            )
+
+            sd2 = await _fetch_slot_async(
+                clone, toggle.entry, toggle.day_entries, api_semaphore,
+            )
+
+            # Persist updated roster to mirror so subsequent reads are fresh
+            if mirror is not None and "error" not in sd2:
+                try:
+                    await asyncio.to_thread(
+                        mirror.save_slot, client.empid, sk, toggle.entry, sd2,
+                    )
+                except Exception as mirror_err:
+                    _log(f"[student_bulk_toggle] mirror write failed {sk}: {mirror_err!r}")
+
+            return SlotUpdateResult(
+                slot_key=sk, ok=True,
+                new_update_id=sd2["update_id"],
+                present_admno=sorted(sd2["present"]),
+            )
+        except Exception as ex:
+            _log(f"[student_bulk_toggle] slot {sk} failed: {ex!r}")
+            return SlotUpdateResult(slot_key=sk, ok=False, error=str(ex))
+        finally:
+            await clone.async_session.close()
+
+    results = await asyncio.gather(
+        *[_process_one(t) for t in req.toggles],
+        return_exceptions=False,
+    )
+    return StudentBulkToggleResponse(results=list(results))

@@ -35,12 +35,16 @@ class JobRegistry:
         jid = uuid4().hex
         with self._lock:
             self._cleanup_locked()
-            active = sum(
-                1 for job in self._jobs.values()
+            active = [
+                job for job in self._jobs.values()
                 if job["owner_sid"] == owner_sid and job["status"] == "running"
-            )
-            if active >= MAX_JOBS_PER_SESSION:
-                raise RuntimeError("maximum active jobs reached for session")
+            ]
+            if len(active) >= MAX_JOBS_PER_SESSION:
+                # Auto-cancel oldest running job instead of rejecting
+                oldest = min(active, key=lambda j: j["created_at"])
+                oldest["cancel_requested"] = True
+                oldest["status"] = "cancelled"
+                oldest["error"] = "Superseded by new job"
             self._jobs[jid] = {
                 "owner_sid": owner_sid,
                 "created_at": time.time(),

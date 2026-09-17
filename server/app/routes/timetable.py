@@ -1,5 +1,5 @@
-"""Timetable routes — always returns proxy instructions to the mobile app."""
-from typing import Any, Dict, Union
+"""Timetable routes — fetches directly from iCloudEMS."""
+from typing import Any, Dict
 from fastapi import APIRouter, HTTPException, Query
 
 from ..config import (
@@ -18,15 +18,11 @@ token_store = create_token_store()
 
 @router.get("/{sid}/timetable")
 def timetable(sid: str, date: str = Query(...), force: bool = Query(False)) -> Dict[str, Any]:
-    """Return proxy instruction for the mobile app to fetch timetable.
-
-    The mobile app executes this against iCloudEMS using its own IP,
-    then posts the raw response to /proxy/ingest.
-    """
+    """Fetch timetable directly from iCloudEMS."""
     client = get_client(sid)
     empid = client.empid
 
-    # 1. Check mirror cache first (no proxy needed if cached)
+    # 1. Check mirror cache first
     if mirror is not None and empid and not force:
         try:
             today = dt_date.today()
@@ -44,10 +40,19 @@ def timetable(sid: str, date: str = Query(...), force: bool = Query(False)) -> D
             _log(f"[timetable] CACHE HIT for empid={empid} date={date} ({len(cached_entries)} entries)")
             return {"date": date, "entries": cached_entries}
 
-    # 2. Return proxy instruction — mobile fetches from iCloudEMS
-    tasks = client.build_proxy_timetable_tasks(empid, date, date)
-    task = tasks[0] if tasks else client.build_proxy_timetable(empid, date, date)
-    task["meta"] = {"route": "timetable", "date": date}
-    task["proxy_required"] = True
-    _log(f"[timetable] proxy instruction for empid={empid} date={date}")
-    return task
+    # 2. Fetch directly from iCloudEMS
+    _log(f"[timetable] fetching from iCloudEMS for empid={empid} date={date}")
+    raw = client._with_auto_refresh(
+        client.get_timetable, empid, date, date,
+    )
+
+    # Save to mirror
+    if mirror is not None and empid:
+        try:
+            mirror.save_raw_timetable(empid, raw)
+        except Exception as err:
+            _log(f"[timetable] mirror write error: {err}")
+
+    entries = extract_entries_for_date(raw, date) if date else []
+    _log(f"[timetable] got {len(entries)} entries for {date}")
+    return {"date": date, "entries": entries}
