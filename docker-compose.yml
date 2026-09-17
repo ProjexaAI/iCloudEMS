@@ -1,7 +1,6 @@
 services:
   warp:
     image: caomingjun/warp
-    container_name: icloudems-warp
     restart: always
     cap_add:
       - NET_ADMIN
@@ -16,7 +15,6 @@ services:
 
   server:
     build: .
-    container_name: icloudems-server
     restart: always
     ports:
       - "8000:8000"
@@ -24,10 +22,12 @@ services:
       - warp
     environment:
       - ICLOUDEMS_PROXY_URL=socks5://warp:1080
-      - DATABASE_URL=${DATABASE_URL:-}
-      - REDIS_URL=${REDIS_URL:-}
-      - TOKEN_ENCRYPTION_KEY=${TOKEN_ENCRYPTION_KEY:-}
+      - ENVIRONMENT=production
+      - SERVER_HOST=0.0.0.0
+      - SERVER_PORT=8000
+      - DATABASE_URL=${DATABASE_URL}
+      - REDIS_URL=${REDIS_URL}
+      - TOKEN_ENCRYPTION_KEY=${TOKEN_ENCRYPTION_KEY}
       - PROJEXA_AUTH_MODE=${PROJEXA_AUTH_MODE:-local}
-      - PROJEXA_JWT_SECRET=${PROJEXA_JWT_SECRET:-}
-      - ENVIRONMENT=${ENVIRONMENT:-production}
+      - PROJEXA_JWT_SECRET=${PROJEXA_JWT_SECRET}
       - ENABLE_TEST_PROXY=1
