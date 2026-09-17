@@ -53,6 +53,9 @@ CACHE_RETENTION_DAYS = _env_int("CACHE_RETENTION_DAYS", 730, 30, 3650)
 
 DEFAULT_ACADEMIC_YEAR = "2026-2027"
 
+PROXY_URL = os.getenv("ICLOUDEMS_PROXY_URL", "").strip()
+# e.g. "socks5://warp:1080" or "http://warp:1080"
+
 DEBUG_MODE = _env_bool("DEBUG_MODE", False)
 
 if ENVIRONMENT == "production" and DEBUG_MODE:

@@ -7,7 +7,7 @@ import threading
 import time
 import uuid
 
-from ..config import ROSTER_DUMP, SUBMIT_DUMP, DEBUG_MODE
+from ..config import ROSTER_DUMP, SUBMIT_DUMP, DEBUG_MODE, PROXY_URL
 from ..logging_utils import _log, _dump_json
 from .http import HTTPError, HttpResponse, HttpSession, AsyncHttpSession
 
@@ -70,6 +70,8 @@ class ICloudEMSClient:
                 "Accept": "application/json",
                 "Accept-Encoding": "gzip",
             })
+            if PROXY_URL:
+                self.plain_session.proxies = {"http": PROXY_URL, "https": PROXY_URL}
 
         self.access_token = None
         self.refresh_token = None

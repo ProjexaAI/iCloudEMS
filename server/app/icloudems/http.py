@@ -6,7 +6,10 @@ back to plain requests -- the app still works but may receive 403s on
 some endpoints.
 """
 import json
+import os
 import sys
+
+from ..config import PROXY_URL
 
 _HTTP_BACKEND = None
 
@@ -66,12 +69,21 @@ class HttpResponse:
 class HttpSession:
     """Wraps either curl_cffi.Session or requests.Session uniformly."""
 
-    def __init__(self):
+    def __init__(self, proxy_url=None):
+        proxy = proxy_url or PROXY_URL or None
         if _HTTP_BACKEND == "curl_cffi":
-            self._s = cffi_requests.Session(impersonate="chrome")
+            kwargs = {"impersonate": "chrome"}
+            if proxy:
+                kwargs["proxy"] = proxy
+            self._s = cffi_requests.Session(**kwargs)
         else:
             self._s = _plain_requests.Session()
+            if proxy:
+                self._s.proxies = {"http": proxy, "https": proxy}
         self._headers = {}
+        if proxy:
+            import logging
+            logging.getLogger("icloudems").info(f"HttpSession using proxy: {proxy}")
 
     def update_headers(self, headers):
         self._headers.update(headers)
@@ -123,9 +135,13 @@ class HttpSession:
 class AsyncHttpSession:
     """Async wrapper using curl_cffi.AsyncSession for non-blocking I/O."""
 
-    def __init__(self):
+    def __init__(self, proxy_url=None):
+        proxy = proxy_url or PROXY_URL or None
         if _HTTP_BACKEND == "curl_cffi":
-            self._s = cffi_requests.AsyncSession(impersonate="chrome")
+            kwargs = {"impersonate": "chrome"}
+            if proxy:
+                kwargs["proxy"] = proxy
+            self._s = cffi_requests.AsyncSession(**kwargs)
         else:
             self._s = None
         self._headers = {}
