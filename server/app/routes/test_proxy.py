@@ -11,6 +11,7 @@ import time
 from curl_cffi import requests as cffi_requests, CurlOpt
 from fastapi import APIRouter, Request
 from fastapi.responses import HTMLResponse, JSONResponse
+from ..config import PROXY_URL
 
 ENABLED = os.getenv("ENABLE_TEST_PROXY", "").strip().lower() in {"1", "true", "yes", "on"}
 
@@ -46,8 +47,12 @@ async def proxy_forward(request: Request):
             headers[k] = v
 
     t0 = time.monotonic()
+    use_warp = body.get("use_warp", False)
     session = cffi_requests.Session(impersonate="chrome")
     kwargs = {"headers": headers, "timeout": timeout_s}
+
+    if use_warp and PROXY_URL:
+        kwargs["proxy"] = PROXY_URL
 
     if use_resolve:
         from urllib.parse import urlparse
@@ -93,6 +98,8 @@ async def proxy_forward(request: Request):
     }
     if resolved_info:
         result["resolved_to"] = resolved_info
+    if use_warp:
+        result["proxy_used"] = PROXY_URL or "not configured"
     return result
 
 
@@ -205,6 +212,9 @@ _HTML = r"""<!DOCTYPE html>
   <label style="font-size:12px; margin-left:16px; color:#58a6ff; font-weight:600">
     <input type="checkbox" id="resolve"> DNS Resolve bypass
   </label>
+  <label style="font-size:12px; margin-left:16px; color:#3fb950; font-weight:600">
+    <input type="checkbox" id="use_warp"> Use WARP proxy
+  </label>
 </div>
 
 <div id="response-box" style="display:none">
@@ -248,6 +258,7 @@ async function send() {
     follow_redirects: document.getElementById('follow').checked,
     timeout: parseInt(document.getElementById('timeout').value) || 30,
     resolve: document.getElementById('resolve').checked,
+    use_warp: document.getElementById('use_warp').checked,
   };
 
   const bodyText = document.getElementById('body').value.trim();
@@ -290,8 +301,11 @@ async function send() {
     }
 
     let displayBody = data.body_json != null ? JSON.stringify(data.body_json, null, 2) : data.body;
-    if (data.resolved_to) {
+    if data.resolved_to {
       displayBody = `Resolved to: ${data.resolved_to.join(', ')}\n\n` + displayBody;
+    }
+    if (data.proxy_used) {
+      displayBody = `Proxy: ${data.proxy_used}\n\n` + displayBody;
     }
     rbo.textContent = displayBody || '(empty)';
   } catch (e) {
