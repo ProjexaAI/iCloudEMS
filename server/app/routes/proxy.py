@@ -10,7 +10,7 @@ from ..icloudems import extract_entries_for_date, parse_roster, build_tt_array_d
 from ..logging_utils import _log
 from ..mirror import mirror
 from ..runtime_state import request_fingerprint, runtime_state
-from ..schemas import ProxyIngestRequest
+from ..schemas import ProxyIngestRequest, SubmitResponse
 from ..storage import create_token_store
 from . import get_client
 
@@ -90,21 +90,6 @@ def proxy_ingest(sid: str, req: ProxyIngestRequest) -> dict:
                 f"{sid}:{idempotency_key}",
                 {"fingerprint": idempotency_key, "response": response.model_dump()},
             )
-        if mirror is not None and empid and entry:
-            try:
-                sk = _slot_key(entry)
-                students = [
-                    {"rollno": s, "admno": s, "name": "", "present": s in present_admno, "known": True}
-                    for s in all_admno
-                ]
-                mirror.save_slot(empid, sk, entry, {
-                    "students": students,
-                    "present": set(present_admno),
-                    "update_id": update_id,
-                    "taken": True,
-                })
-            except Exception as err:
-                _log(f"[proxy/ingest/submit] mirror write error: {err}")
         return {"ok": True, "stored_present": present, "stored_absent": absent}
 
     raise HTTPException(400, f"unknown proxy route: {route}")

@@ -436,7 +436,7 @@ def load_courses(sid: str, req: CoursesLoadRequest):
     client = get_client(sid)
     date_from = req.date_from.isoformat()
     date_to = req.date_to.isoformat()
-    if mirror is not None:
+    if mirror is not None and not req.force:
         try:
             if mirror.has_fresh_sync(client.empid, date_from, date_to):
                 cached = mirror.cached_course_result(client.empid, date_from, date_to)
@@ -447,11 +447,19 @@ def load_courses(sid: str, req: CoursesLoadRequest):
                     return CoursesLoadResponse(job_id=jid)
         except Exception as ex:
             _log(f"[courses] cache read failed: {ex!r}")
-    raise HTTPException(
-        409,
-        "No cached course data available. "
-        "Please sync timetable and rosters from the mobile app first.",
+
+    # No cached data — start a background sync job
+    jid = jobs.create(owner_sid=sid)
+    jobs.update(jid, status="running", progress={"phase": "starting", "done": 0, "total": 1})
+    _log(f"[courses] no cache for empid={client.empid} {date_from}..{date_to}, starting background sync job {jid}")
+    t = threading.Thread(
+        target=_run_load_job_thread,
+        args=(jid, client.clone(), date_from, date_to),
+        kwargs={"force": req.force, "subject_id": req.subject_id},
+        daemon=True,
     )
+    t.start()
+    return CoursesLoadResponse(job_id=jid)
 
 
 @router.get("/{sid}/jobs/{jid}")

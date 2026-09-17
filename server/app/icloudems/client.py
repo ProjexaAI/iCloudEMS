@@ -348,6 +348,9 @@ class ICloudEMSClient:
                 f"Safety: refusing submit where only {len(present_admno)} "
                 f"of {len(students)} are present"
             )
+
+        self.warmup()
+
         payload = {
             "fromTime": entry.get("fromTime"),
             "toTime": entry.get("toTime"),
@@ -369,15 +372,22 @@ class ICloudEMSClient:
             "copyAttTime": {},
             "updateId": str(update_id) if update_id not in (None, "", 0) else "0",
         }
+
+        cookie_parts = []
+        if self.plain_session is not None:
+            for k, v in self.plain_session.cookies.items():
+                cookie_parts.append(f"{k}={v}")
+
         return {
             "method": "POST_MULTIPART",
             "url": f"{self.KRMU_HOST}/corecampus/admin/attendance/attendanceTakenSubmit.php",
             "headers": {
                 "Authorization": self.access_token or "",
                 "Referer": "corecampus/admin/attendance/attendanceTakenSubmit.php",
-                "Origin": self.KRMU_HOST,
                 "Accept": "application/json",
-                "User-Agent": self.USER_AGENT,
+                "Accept-Encoding": "gzip",
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
+                **({"Cookie": "; ".join(cookie_parts)} if cookie_parts else {}),
             },
             "form_data": {
                 "code": self.CLIENT,

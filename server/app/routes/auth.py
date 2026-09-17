@@ -76,9 +76,23 @@ def start_from_projexa_token(request: Request):
     if not restored or not client.empid:
         store.delete(sid)
         raise HTTPException(409, "iCloudEMS account link required")
-    return StartLoginResponse(
-        session_id=sid, state="ready", email=email, empid=client.empid,
-    )
+
+    if ICloudEMSClient.token_is_valid(client.access_token):
+        return StartLoginResponse(
+            session_id=sid, state="ready", email=email, empid=client.empid,
+        )
+
+    if client.refresh_token:
+        try:
+            client.refresh()
+            client.save_to_store(token_store, email)
+            return StartLoginResponse(
+                session_id=sid, state="ready", email=email, empid=client.empid,
+            )
+        except Exception:
+            pass
+
+    raise HTTPException(401, "iCloudEMS token expired. Please re-link your iCloudEMS account.")
 
 
 def _projexa_email_session(request: Request):

@@ -15,7 +15,7 @@ from ..logging_utils import _log
 from ..mirror import mirror
 from ..runtime_state import request_fingerprint, runtime_state
 from ..schemas import (
-    RosterRequest, RosterResponse, StudentModel,
+    ProxyInstruction, RosterRequest, RosterResponse, StudentModel,
     SubmitRequest, SubmitResponse,
 )
 from ..storage import create_token_store
@@ -63,14 +63,14 @@ def roster(sid: str, req: RosterRequest) -> dict:
                 students=[StudentModel(**s) for s in c["students"]],
                 update_id=str(c["update_id"]) if c["update_id"] not in (None, "", 0) else None,
                 taken_flag=c["taken"],
-            )
+            ).model_dump()
 
     # 2. Return proxy instruction
     tt_array = build_tt_array_data(req.day_entries)
     task = client.build_proxy_roster(empid, req.entry, tt_array)
     task["meta"] = {"route": "roster", "entry": req.entry, "day_entries": req.day_entries}
     _log(f"[roster] proxy instruction for slot {sk}")
-    return ProxyInstruction(**task)
+    return ProxyInstruction(**task).model_dump()
 
 
 @router.post("/{sid}/submit")
@@ -84,7 +84,7 @@ def submit(sid: str, req: SubmitRequest) -> dict:
     if cached:
         if cached["fingerprint"] != fingerprint:
             raise HTTPException(409, "idempotency key was reused with a different request")
-        return SubmitResponse(**cached["response"])
+        return SubmitResponse(**cached["response"]).model_dump()
 
     _log(f"=== SUBMIT sid={sid} key={key} ===")
     _log(f"total={len(req.all_admno)} present={len(req.present_admno)} "
@@ -102,7 +102,7 @@ def submit(sid: str, req: SubmitRequest) -> dict:
         req.academicyear, req.update_id, idempotency_key=key,
     )
     _log(f"[submit] proxy instruction for key={key}")
-    return ProxyInstruction(**task)
+    return ProxyInstruction(**task).model_dump()
 
 
 @router.post("/{sid}/submit/ingest")
@@ -121,23 +121,7 @@ def ingest_submit(sid: str, req: SubmitRequest) -> dict:
         {"fingerprint": fingerprint, "response": response.model_dump()},
     )
 
-    if mirror is not None and client.empid:
-        try:
-            sk = _slot_key(req.entry)
-            students = [
-                {"rollno": s, "admno": s, "name": "", "present": s in req.present_admno, "known": True}
-                for s in req.all_admno
-            ]
-            mirror.save_slot(client.empid, sk, req.entry, {
-                "students": students,
-                "present": set(req.present_admno),
-                "update_id": req.update_id,
-                "taken": True,
-            })
-        except Exception as err:
-            _log(f"[submit/ingest] mirror update error: {err}")
-
-    return response
+    return response.model_dump()
 
 
 @router.post("/{sid}/roster/ingest")
@@ -164,7 +148,7 @@ def ingest_roster(sid: str, entry: dict, raw_data: dict) -> dict:
         students=[StudentModel(**s) for s in students],
         update_id=str(update_id) if update_id not in (None, "", 0) else None,
         taken_flag=taken_flag,
-    )
+    ).model_dump()
 
 
 @router.post("/{sid}/attendance/copy-previous")
