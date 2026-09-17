@@ -11,6 +11,9 @@ from .config import (
 
 
 def verify_projexa_token(token: str) -> dict:
+    import logging
+    logger = logging.getLogger("projexa_auth")
+    logger.warning("token length=%d, first20=%r", len(token), token[:20])
     try:
         claims = jwt.decode(
             token,
@@ -21,6 +24,7 @@ def verify_projexa_token(token: str) -> dict:
             options={"require": ["sub", "iss", "aud", "exp", "iat"]},
         )
     except jwt.PyJWTError as exc:
+        logger.warning("JWT decode failed: %s", exc)
         raise HTTPException(401, "invalid Projexa attendance token") from exc
     scopes = set(claims.get("scope", []))
     roles = set(claims.get("roles", []))

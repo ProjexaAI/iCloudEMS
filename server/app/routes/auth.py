@@ -60,7 +60,10 @@ def start_login(request: Request, req: StartLoginRequest):
 @router.post("/token", response_model=StartLoginResponse)
 def start_from_projexa_token(request: Request):
     """Create an iCloud session from an already authenticated Projexa user."""
+    import logging
+    logger = logging.getLogger("auth")
     authorization = request.headers.get("Authorization", "")
+    logger.warning("Authorization header: %r", authorization[:80] if authorization else "")
     if not authorization.startswith("Bearer "):
         raise HTTPException(401, "Projexa bearer token required")
     claims = verify_projexa_token(authorization[7:].strip())
