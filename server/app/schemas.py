@@ -98,6 +98,7 @@ class RosterResponse(StrictModel):
 
 class SubmitRequest(StrictModel):
     entry: Dict[str, Any]
+    day_entries: List[Dict[str, Any]] = Field(default_factory=list, max_length=MAX_DAY_ENTRIES)
     all_admno: List[str] = Field(min_length=1, max_length=MAX_STUDENTS)
     present_admno: List[str] = Field(max_length=MAX_STUDENTS)  # maps to absent_rollno
     update_id: Optional[str] = Field(default=None, max_length=128)

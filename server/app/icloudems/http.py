@@ -11,6 +11,11 @@ import sys
 
 from ..config import PROXY_URL
 
+try:
+    from curl_cffi import CurlMime as _CurlMime
+except ImportError:
+    _CurlMime = None
+
 _HTTP_BACKEND = None
 
 try:
@@ -66,6 +71,27 @@ class HttpResponse:
             )
 
 
+def _files_to_multipart(files_dict):
+    """Convert a requests-style files dict to a CurlMime object.
+
+    files_dict format: {name: (filename, value)} or {name: value}
+    curl_cffi requires ``multipart=CurlMime(...)`` instead of ``files=``.
+    """
+    mime = _CurlMime()
+    for key, val in files_dict.items():
+        if isinstance(val, tuple):
+            filename, value = val[0], val[1]
+        else:
+            filename, value = None, val
+        if isinstance(value, str):
+            value = value.encode("utf-8")
+        kwargs = {"name": key, "data": value}
+        if filename:
+            kwargs["filename"] = filename
+        mime.addpart(**kwargs)
+    return mime
+
+
 class HttpSession:
     """Wraps either curl_cffi.Session or requests.Session uniformly."""
 
@@ -109,8 +135,13 @@ class HttpSession:
         if headers:
             merged.update(headers)
         try:
-            raw = self._s.post(url, json=json, data=data, files=files,
-                               headers=merged, timeout=timeout)
+            if files and _HTTP_BACKEND == "curl_cffi":
+                mime = _files_to_multipart(files)
+                raw = self._s.post(url, json=json, data=data, multipart=mime,
+                                   headers=merged, timeout=timeout)
+            else:
+                raw = self._s.post(url, json=json, data=data, files=files,
+                                   headers=merged, timeout=timeout)
         except Exception as e:
             raise HTTPError(0, type(e).__name__, "POST", url, str(e))
         return self._wrap(raw, method="POST")
@@ -169,8 +200,13 @@ class AsyncHttpSession:
         if headers:
             merged.update(headers)
         try:
-            raw = await self._s.post(url, json=json, data=data, files=files,
-                                     headers=merged, timeout=timeout)
+            if files:
+                mime = _files_to_multipart(files)
+                raw = await self._s.post(url, json=json, data=data, multipart=mime,
+                                         headers=merged, timeout=timeout)
+            else:
+                raw = await self._s.post(url, json=json, data=data, files=files,
+                                         headers=merged, timeout=timeout)
         except Exception as e:
             raise HTTPError(0, type(e).__name__, "POST", url, str(e))
         return self._wrap(raw, method="POST")
