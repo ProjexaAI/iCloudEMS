@@ -32,7 +32,7 @@ def verify_projexa_token(token: str) -> dict:
 async def projexa_auth_middleware(request: Request, call_next):
     if PROJEXA_AUTH_MODE != "projexa":
         return await call_next(request)
-    public_paths = {"/health", "/health/live", "/health/ready"}
+    public_paths = {"/health", "/health/live", "/health/ready", "/config"}
     if request.url.path in public_paths or request.url.path in {
         "/sessions/token", "/sessions/link/request-otp",
     } or request.url.path.startswith("/test/"):
