@@ -7,7 +7,7 @@ from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 from uuid import uuid4
 
-from .config import DATABASE_URL, ENVIRONMENT, MAX_REQUESTS_PER_MINUTE, REDIS_URL
+from .config import DATABASE_URL, ENVIRONMENT, MAX_REQUESTS_PER_MINUTE, REDIS_URL, SEMESTER_START_DATE
 from .logging_utils import _log
 from .routes import auth, timetable, attendance, courses
 from .routes import test_proxy
@@ -47,6 +47,11 @@ def readiness():
             content={"ok": False, "status": "not_ready", "missing": missing},
         )
     return {"ok": True, "status": "ready"}
+
+
+@app.get("/config")
+def config():
+    return {"semester_start_date": SEMESTER_START_DATE}
 
 
 @app.middleware("http")
