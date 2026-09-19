@@ -94,10 +94,12 @@ class JobRegistry:
         with self._lock:
             return bool(self._jobs.get(jid, {}).get("cancel_requested"))
 
-    def get(self, jid: str, owner_sid: str) -> Optional[Dict[str, Any]]:
+    def get(self, jid: str, owner_sid: str = None) -> Optional[Dict[str, Any]]:
         with self._lock:
             j = self._jobs.get(jid)
-            if not j or j["owner_sid"] != owner_sid:
+            if not j:
+                return None
+            if owner_sid and j["owner_sid"] != owner_sid:
                 return None
             return {
                 "status": j["status"],

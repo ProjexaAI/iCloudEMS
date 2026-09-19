@@ -79,6 +79,7 @@ class StudentModel(StrictModel):
     name: str
     present: bool
     known: bool
+    avatar_url: Optional[str] = None
 
 
 class RosterRequest(StrictModel):

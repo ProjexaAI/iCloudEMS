@@ -4,7 +4,7 @@ import threading
 from fastapi import HTTPException
 
 from ..icloudems import ICloudEMSClient
-from ..logging_utils import _log
+from ..logging_utils import _log, _timed_ms
 from ..sessions import store
 from ..storage import create_token_store
 
@@ -18,7 +18,9 @@ def get_client(sid: str) -> ICloudEMSClient:
     Raises 404 if session not found, 400 if not logged in.
     Proactively refreshes the access token if it's close to expiry.
     """
+    done = _timed_ms("[get_client]")
     client = store.get(sid)
+    done("session_lookup")
     if not client:
         raise HTTPException(404, "session not found")
     if not client.empid:

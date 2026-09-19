@@ -5,7 +5,6 @@ that encrypts tokens at rest. The interface is intentionally tiny.
 """
 import json
 import threading
-from contextlib import closing
 from pathlib import Path
 
 from .config import DATABASE_URL, ENVIRONMENT, TOKEN_ENCRYPTION_KEY, TOKEN_STORE_PATH
@@ -57,6 +56,9 @@ class TokenStore:
 class DatabaseTokenStore:
     """PostgreSQL-backed token store with application-layer encryption."""
 
+    _pool = None
+    _pool_lock = threading.Lock()
+
     def __init__(self, database_url=None, encryption_key=None):
         self.database_url = database_url or DATABASE_URL
         key = encryption_key or TOKEN_ENCRYPTION_KEY
@@ -73,10 +75,17 @@ class DatabaseTokenStore:
         self._ensure_schema()
 
     def _connect(self):
-        return self._psycopg.connect(self.database_url)
+        if DatabaseTokenStore._pool is None:
+            with DatabaseTokenStore._pool_lock:
+                if DatabaseTokenStore._pool is None:
+                    from psycopg_pool import ConnectionPool
+                    DatabaseTokenStore._pool = ConnectionPool(
+                        self.database_url, min_size=2, max_size=10,
+                    )
+        return DatabaseTokenStore._pool.connection()
 
     def _ensure_schema(self):
-        with closing(self._connect()) as conn:
+        with self._connect() as conn:
             with conn.cursor() as cur:
                 cur.execute("""
                     CREATE TABLE IF NOT EXISTS provider_tokens (
@@ -99,7 +108,7 @@ class DatabaseTokenStore:
         return self._fernet.decrypt(bytes(value)).decode() if value else None
 
     def get(self, email):
-        with self._lock, closing(self._connect()) as conn:
+        with self._connect() as conn:
             with conn.cursor() as cur:
                 cur.execute(
                     "SELECT contact, username, empid, access_token, refresh_token, device_id, saved_at "
@@ -117,7 +126,7 @@ class DatabaseTokenStore:
         }
 
     def set(self, email, record):
-        with self._lock, closing(self._connect()) as conn:
+        with self._lock, self._connect() as conn:
             with conn.cursor() as cur:
                 cur.execute("""
                     INSERT INTO provider_tokens
@@ -141,7 +150,7 @@ class DatabaseTokenStore:
             conn.commit()
 
     def delete(self, email):
-        with self._lock, closing(self._connect()) as conn:
+        with self._lock, self._connect() as conn:
             with conn.cursor() as cur:
                 cur.execute("DELETE FROM provider_tokens WHERE email = %s", (email.lower().strip(),))
             conn.commit()

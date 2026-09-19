@@ -38,7 +38,7 @@ from ..icloudems import (
     parse_roster,
 )
 from ..jobs import jobs
-from ..logging_utils import _log, _dump_json
+from ..logging_utils import _log, _dump_json, _timed_ms
 from ..mirror import mirror
 from ..schemas import (
     CoursesLoadRequest, CoursesLoadResponse,
@@ -269,7 +269,7 @@ async def _run_load_job_async(jid: str, client: ICloudEMSClient,
                     if mirror is not None:
                         try:
                             await asyncio.to_thread(
-                                mirror.save_slot, client.empid, sk, e, data,
+                                mirror.save_slot, client.empid, sk, e, data, bulk=True,
                             )
                         except Exception as mirror_error:
                             _log(f"[courses] mirror write failed {sk}: {mirror_error!r}")
@@ -430,25 +430,27 @@ def _run_load_job_thread(jid: str, client: ICloudEMSClient,
 @router.post("/{sid}/courses/load")
 def load_courses(sid: str, req: CoursesLoadRequest):
     """Start a background job to fetch course data directly from iCloudEMS."""
+    done = _timed_ms("[route:courses_load]")
     client = get_client(sid)
+    done("get_client")
     date_from = req.date_from.isoformat()
     date_to = req.date_to.isoformat()
 
-    # Check mirror cache first
+    # Check mirror cache first — return result directly, no job needed
     if mirror is not None and not req.force:
         try:
             if mirror.has_fresh_sync(client.empid, date_from, date_to):
+                done("has_fresh_sync")
                 cached = mirror.cached_course_result(client.empid, date_from, date_to)
+                done(f"cached_course_result courses={len(cached.get('courses', [])) if cached else 0}")
                 if cached is not None:
-                    jid = jobs.create(owner_sid=sid)
-                    jobs.update(jid, status="done", result=cached,
-                                progress={"phase": "cached", "done": 1, "total": 1})
-                    return {"job_id": jid}
+                    return {"job_id": None, "status": "done", "result": cached}
         except Exception as ex:
             _log(f"[courses] cache read failed: {ex!r}")
 
     # Create a job to track progress
     jid = jobs.create(owner_sid=sid)
+    done("job_created")
 
     # Start background thread to fetch directly from iCloudEMS
     worker = client.clone()
@@ -467,8 +469,13 @@ def load_courses(sid: str, req: CoursesLoadRequest):
 
 @router.get("/{sid}/jobs/{jid}")
 def job_status(sid: str, jid: str):
+    done = _timed_ms("[route:job_status]")
     get_client(sid)
+    done("get_client")
     j = jobs.get(jid, owner_sid=sid)
+    if not j:
+        j = jobs.get(jid)
+    done("job_lookup")
     if not j:
         raise HTTPException(404, "job not found")
     return j
@@ -484,32 +491,42 @@ def cancel_job(sid: str, jid: str):
 
 @router.get("/{sid}/sync/status")
 def sync_status(sid: str):
+    done = _timed_ms("[route:sync_status]")
     client = get_client(sid)
+    done("get_client")
     if mirror is None:
         raise HTTPException(503, "attendance mirror is not configured")
-    return mirror.sync_status(client.empid) or {
+    result = mirror.sync_status(client.empid) or {
         "status": "never_synced", "slots_total": 0, "slots_done": 0,
     }
+    done("mirror_query")
+    return result
 
 
 @router.get("/{sid}/subjects")
 def subjects(sid: str, date_from: Optional[str] = None,
              date_to: Optional[str] = None):
+    done = _timed_ms("[route:subjects]")
     client = get_client(sid)
+    done("get_client")
     if mirror is None:
         raise HTTPException(503, "attendance mirror is not configured")
-    return {
+    result = {
         "date_from": date_from,
         "date_to": date_to,
         "subjects": mirror.subjects(client.empid, date_from, date_to),
     }
+    done("mirror_query")
+    return result
 
 
 @router.get("/{sid}/students/{student_admno}/attendance")
 def student_attendance(sid: str, student_admno: str,
                        date_from: Optional[str] = None,
                        date_to: Optional[str] = None):
+    done = _timed_ms("[route:student_attendance]")
     client = get_client(sid)
+    done("get_client")
     if mirror is None:
         raise HTTPException(503, "attendance mirror is not configured")
     try:
@@ -518,6 +535,7 @@ def student_attendance(sid: str, student_admno: str,
         )
     except ValueError as exc:
         raise HTTPException(400, "invalid attendance date") from exc
+    done(f"mirror_query rows={len(rows)}")
     return {"student_admno": student_admno, "records": rows}
 
 
@@ -526,31 +544,39 @@ def student_summary(sid: str, student_admno: str,
                     date_from: Optional[str] = None,
                     date_to: Optional[str] = None,
                     threshold: float = 75):
+    done = _timed_ms("[route:student_summary]")
     client = get_client(sid)
+    done("get_client")
     if mirror is None:
         raise HTTPException(503, "attendance mirror is not configured")
     if not 0 <= threshold <= 100:
         raise HTTPException(400, "threshold must be between 0 and 100")
-    return {
+    result = {
         "student_admno": student_admno,
         "subjects": mirror.student_summary(
             client.empid, student_admno, date_from, date_to, threshold,
         ),
     }
+    done(f"mirror_query rows={len(result['subjects'])}")
+    return result
 
 
 @router.get("/{sid}/attendance/low")
 def low_attendance(sid: str, date_from: Optional[str] = None,
                    date_to: Optional[str] = None, threshold: float = 75):
+    done = _timed_ms("[route:low_attendance]")
     client = get_client(sid)
+    done("get_client")
     if mirror is None:
         raise HTTPException(503, "attendance mirror is not configured")
     if not 0 <= threshold <= 100:
         raise HTTPException(400, "threshold must be between 0 and 100")
-    return {
+    result = {
         "threshold": threshold,
         "records": mirror.low_attendance(client.empid, date_from, date_to, threshold),
     }
+    done(f"mirror_query rows={len(result['records'])}")
+    return result
 
 
 @router.post("/{sid}/slots/state", response_model=SlotStateResponse)
@@ -798,3 +824,18 @@ async def student_bulk_toggle(sid: str, student_admno: str,
         return_exceptions=False,
     )
     return StudentBulkToggleResponse(results=list(results))
+
+
+@router.get("/{sid}/delta")
+def get_delta(sid: str, since_version: int = 0):
+    """Return all changes since the given version for delta sync."""
+    done = _timed_ms("[route:delta]")
+    client = get_client(sid)
+    done("get_client")
+    if mirror is None:
+        raise HTTPException(503, "attendance mirror is not configured")
+    result = mirror.get_delta(client.empid, since_version)
+    import json
+    size = len(json.dumps(result, default=str))
+    done(f"changes={len(result.get('changes', []))} version={result.get('version', 0)} size={size}bytes")
+    return result

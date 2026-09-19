@@ -730,11 +730,13 @@ class ICloudEMSClient:
     async def _with_auto_refresh_async(self, fn, *args, **kwargs):
         if self.access_token_needs_refresh() and self.refresh_token:
             try:
-                with _refresh_lock:
-                    if self.access_token_needs_refresh():
-                        self.refresh()
-                        if self._token_store and self.contact:
-                            self.save_to_store(self._token_store, self.contact)
+                def _do_refresh():
+                    with _refresh_lock:
+                        if self.access_token_needs_refresh():
+                            self.refresh()
+                            if self._token_store and self.contact:
+                                self.save_to_store(self._token_store, self.contact)
+                await asyncio.get_event_loop().run_in_executor(None, _do_refresh)
             except Exception as refresh_err:
                 self._log("proactive refresh failed:", refresh_err)
                 raise HTTPError(401, "Session expired and refresh failed",
@@ -746,8 +748,10 @@ class ICloudEMSClient:
                 raise
             self._log(f"got {e.status}, attempting refresh…")
             try:
-                with _refresh_lock:
-                    self.refresh()
+                def _do_refresh_retry():
+                    with _refresh_lock:
+                        self.refresh()
+                await asyncio.get_event_loop().run_in_executor(None, _do_refresh_retry)
             except Exception as refresh_err:
                 self._log("refresh failed:", refresh_err)
                 raise HTTPError(401, "Session expired and refresh failed",

@@ -6,7 +6,7 @@ from ..config import (
     ROSTER_CACHE_TTL_SECONDS, ROSTER_CACHE_TTL_TODAY_SECONDS, ROSTER_CACHE_TTL_RECENT_SECONDS,
 )
 from ..icloudems import extract_entries_for_date
-from ..logging_utils import _log
+from ..logging_utils import _log, _timed_ms
 from ..mirror import mirror
 from ..storage import create_token_store
 from . import get_client
@@ -17,9 +17,11 @@ token_store = create_token_store()
 
 
 @router.get("/{sid}/timetable")
-def timetable(sid: str, date: str = Query(...), force: bool = Query(False)) -> Dict[str, Any]:
+async def timetable(sid: str, date: str = Query(...), force: bool = Query(False)) -> Dict[str, Any]:
     """Fetch timetable directly from iCloudEMS."""
+    done = _timed_ms("[route:timetable]")
     client = get_client(sid)
+    done("get_client")
     empid = client.empid
 
     # 1. Check mirror cache first
@@ -36,15 +38,17 @@ def timetable(sid: str, date: str = Query(...), force: bool = Query(False)) -> D
         except Exception:
             ttl = ROSTER_CACHE_TTL_TODAY_SECONDS
         cached_entries = mirror.get_timetable(empid, date, date, max_age_seconds=ttl)
+        done(f"mirror_get entries={len(cached_entries) if cached_entries else 'miss'}")
         if cached_entries is not None:
             _log(f"[timetable] CACHE HIT for empid={empid} date={date} ({len(cached_entries)} entries)")
             return {"date": date, "entries": cached_entries}
 
-    # 2. Fetch directly from iCloudEMS
+    # 2. Fetch directly from iCloudEMS (async)
     _log(f"[timetable] fetching from iCloudEMS for empid={empid} date={date}")
-    raw = client._with_auto_refresh(
-        client.get_timetable, empid, date, date,
+    raw = await client._with_auto_refresh_async(
+        client.get_timetable_async, empid, date, date,
     )
+    done("icloudems_fetch")
 
     # Save to mirror
     if mirror is not None and empid:

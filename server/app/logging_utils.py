@@ -6,6 +6,8 @@ import json
 import logging
 import os
 import re
+import time
+from contextlib import contextmanager
 from datetime import datetime
 from pathlib import Path
 
@@ -40,6 +42,27 @@ def _log(*parts):
         _logger.info(msg)
     except Exception:
         pass
+
+
+@contextmanager
+def _timed(label: str):
+    """Context manager that logs wall-clock time for a block."""
+    t0 = time.perf_counter()
+    try:
+        yield
+    finally:
+        ms = (time.perf_counter() - t0) * 1000
+        _log(f"[timing] {label} took {ms:.1f}ms")
+
+
+def _timed_ms(label: str):
+    """Return a callable that logs elapsed time when called with no args."""
+    t0 = time.perf_counter()
+    def finish(extra=""):
+        ms = (time.perf_counter() - t0) * 1000
+        suffix = f"  {extra}" if extra else ""
+        _log(f"[timing] {label} took {ms:.1f}ms{suffix}")
+    return finish
 
 
 def _dump_json(data, path):

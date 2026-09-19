@@ -1,10 +1,27 @@
 """PostgreSQL mirror for timetable and attendance snapshots."""
 import json
+import time
 import threading
-from contextlib import closing
 from datetime import datetime, timedelta, timezone
 
 from .config import DATABASE_URL, ENVIRONMENT
+from .logging_utils import _log as _mlog
+
+# Reuse a single connection pool across the process
+_pool = None
+_pool_lock = threading.Lock()
+
+
+def _get_pool(database_url):
+    global _pool
+    if _pool is not None:
+        return _pool
+    with _pool_lock:
+        if _pool is not None:
+            return _pool
+        from psycopg_pool import ConnectionPool
+        _pool = ConnectionPool(database_url, min_size=2, max_size=20)
+        return _pool
 
 
 class MirrorStore:
@@ -19,14 +36,23 @@ class MirrorStore:
             raise RuntimeError("install psycopg for the data mirror") from exc
         self._psycopg = psycopg
         self._jsonb = Jsonb
-        self._lock = threading.Lock()
+        self._empid_locks: dict[str, threading.Lock] = {}
+        self._empid_locks_guard = threading.Lock()
+        self._global_lock = threading.Lock()
         self._ensure_schema()
 
+    def _empid_lock(self, empid: str) -> threading.Lock:
+        key = str(empid)
+        with self._empid_locks_guard:
+            if key not in self._empid_locks:
+                self._empid_locks[key] = threading.Lock()
+            return self._empid_locks[key]
+
     def _connect(self):
-        return self._psycopg.connect(self.database_url)
+        return _get_pool(self.database_url).connection()
 
     def _ensure_schema(self):
-        with closing(self._connect()) as conn:
+        with self._connect() as conn:
             with conn.cursor() as cur:
                 cur.execute("""
                     CREATE TABLE IF NOT EXISTS timetable_entries (
@@ -56,8 +82,14 @@ class MirrorStore:
                         update_id TEXT,
                         class_date DATE NOT NULL,
                         synced_at TIMESTAMPTZ NOT NULL,
+                        student_name TEXT,
+                        student_avatar TEXT,
+                        student_rollno TEXT,
                         PRIMARY KEY (empid, slot_key, student_admno)
                     );
+                    ALTER TABLE attendance_records ADD COLUMN IF NOT EXISTS student_name TEXT;
+                    ALTER TABLE attendance_records ADD COLUMN IF NOT EXISTS student_avatar TEXT;
+                    ALTER TABLE attendance_records ADD COLUMN IF NOT EXISTS student_rollno TEXT;
                     CREATE TABLE IF NOT EXISTS sync_runs (
                         empid TEXT PRIMARY KEY,
                         status TEXT NOT NULL,
@@ -71,12 +103,110 @@ class MirrorStore:
                     );
                     CREATE INDEX IF NOT EXISTS attendance_student_idx
                         ON attendance_records (empid, student_admno, class_date);
+                    CREATE INDEX IF NOT EXISTS attendance_empid_date_idx
+                        ON attendance_records (empid, class_date);
+                    CREATE TABLE IF NOT EXISTS data_versions (
+                        empid TEXT PRIMARY KEY,
+                        version INTEGER NOT NULL DEFAULT 0
+                    );
+                    CREATE TABLE IF NOT EXISTS data_changes (
+                        empid TEXT NOT NULL,
+                        version INTEGER NOT NULL,
+                        change_type TEXT NOT NULL,
+                        slot_key TEXT,
+                        data JSONB NOT NULL,
+                        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                        PRIMARY KEY (empid, version)
+                    );
+                    CREATE INDEX IF NOT EXISTS data_changes_empid_idx
+                        ON data_changes (empid, version);
                 """)
+                cur.execute("""
+                    UPDATE attendance_records a
+                    SET student_name = rstudent->>'name',
+                        student_avatar = rstudent->>'avatar_url',
+                        student_rollno = rstudent->>'rollno'
+                    FROM roster_snapshots rs,
+                         jsonb_array_elements(COALESCE(rs.students, '[]'::jsonb)) rstudent
+                    WHERE a.empid = rs.empid AND a.slot_key = rs.slot_key
+                      AND rstudent->>'admno' = a.student_admno
+                      AND a.student_name IS NULL
+                """)
+            conn.commit()
+
+    def _bump_version(self, empid, change_type, slot_key=None, data=None):
+        """Increment the version counter and record a change."""
+        with self._empid_lock(empid), self._connect() as conn:
+            with conn.cursor() as cur:
+                cur.execute("""
+                    INSERT INTO data_versions (empid, version) VALUES (%s, 1)
+                    ON CONFLICT (empid) DO UPDATE SET version = data_versions.version + 1
+                    RETURNING version
+                """, (str(empid),))
+                new_version = cur.fetchone()[0]
+                if change_type and data is not None:
+                    cur.execute("""
+                        INSERT INTO data_changes (empid, version, change_type, slot_key, data, created_at)
+                        VALUES (%s, %s, %s, %s, %s, %s)
+                    """, (str(empid), new_version, change_type, slot_key,
+                          self._jsonb(data), datetime.now(timezone.utc)))
+            conn.commit()
+        return new_version
+
+    def get_delta(self, empid, since_version=0):
+        """Return all changes after since_version and the current version."""
+        with self._connect() as conn:
+            with conn.cursor() as cur:
+                cur.execute("SELECT version FROM data_versions WHERE empid = %s",
+                            (str(empid),))
+                row = cur.fetchone()
+                current_version = row[0] if row else 0
+                if since_version <= 0:
+                    return {"version": current_version, "changes": []}
+                cur.execute("""
+                    SELECT version, change_type, slot_key, data, created_at
+                    FROM data_changes
+                    WHERE empid = %s AND version > %s
+                    ORDER BY version
+                """, (str(empid), since_version))
+                rows = cur.fetchall()
+        changes = []
+        for ver, ctype, sk, data, created_at in rows:
+            changes.append({
+                "version": ver,
+                "type": ctype,
+                "slot_key": sk,
+                "data": data,
+                "timestamp": created_at.isoformat() if created_at else None,
+            })
+        return {"version": current_version, "changes": changes}
+
+    def current_version(self, empid):
+        with self._connect() as conn:
+            with conn.cursor() as cur:
+                cur.execute("SELECT version FROM data_versions WHERE empid = %s",
+                            (str(empid),))
+                row = cur.fetchone()
+                return row[0] if row else 0
+
+    def cleanup_old_changes(self, keep_versions=500):
+        """Remove old change records, keeping only the last N versions per empid."""
+        with self._connect() as conn:
+            with conn.cursor() as cur:
+                cur.execute("""
+                    DELETE FROM data_changes
+                    WHERE (empid, version) NOT IN (
+                        SELECT empid, version FROM data_changes dc
+                        WHERE dc.empid = data_changes.empid
+                        ORDER BY dc.version DESC
+                        LIMIT %s
+                    )
+                """, (keep_versions,))
             conn.commit()
 
     def start_sync(self, empid, date_from, date_to, slots_total=0):
         now = datetime.now(timezone.utc)
-        with self._lock, closing(self._connect()) as conn:
+        with self._empid_lock(empid), self._connect() as conn:
             with conn.cursor() as cur:
                 cur.execute("""
                     INSERT INTO sync_runs
@@ -108,17 +238,21 @@ class MirrorStore:
         if not fields:
             return
         values.append(str(empid))
-        with self._lock, closing(self._connect()) as conn:
+        with self._empid_lock(empid), self._connect() as conn:
             with conn.cursor() as cur:
                 cur.execute(
                     "UPDATE sync_runs SET " + ", ".join(fields) + " WHERE empid = %s",
                     values,
                 )
             conn.commit()
+        if status in {"done", "error"}:
+            self._bump_version(empid, "sync_status", None, {
+                "status": status, "error": error,
+            })
 
     def remove_legacy_slot_keys(self, empid, date_from, date_to):
         """Remove rows written with the pre-course-aware slot key format."""
-        with self._lock, closing(self._connect()) as conn:
+        with self._empid_lock(empid), self._connect() as conn:
             with conn.cursor() as cur:
                 cur.execute("""
                     DELETE FROM attendance_records
@@ -140,7 +274,7 @@ class MirrorStore:
 
     def cleanup_old_data(self, retention_days):
         cutoff = datetime.now(timezone.utc) - timedelta(days=retention_days)
-        with self._lock, closing(self._connect()) as conn:
+        with self._global_lock, self._connect() as conn:
             with conn.cursor() as cur:
                 cur.execute("DELETE FROM attendance_records WHERE synced_at < %s", (cutoff,))
                 cur.execute("DELETE FROM roster_snapshots WHERE synced_at < %s", (cutoff,))
@@ -149,7 +283,7 @@ class MirrorStore:
             conn.commit()
 
     def sync_status(self, empid):
-        with closing(self._connect()) as conn:
+        with self._connect() as conn:
             with conn.cursor() as cur:
                 cur.execute("""
                     SELECT status, date_from, date_to, slots_total, slots_done,
@@ -169,7 +303,8 @@ class MirrorStore:
 
     def cached_course_result(self, empid, date_from, date_to):
         """Rebuild the course-history response from the local mirror."""
-        with closing(self._connect()) as conn:
+        t0 = time.perf_counter()
+        with self._connect() as conn:
             with conn.cursor() as cur:
                 cur.execute("""
                     SELECT t.slot_key, t.entry, r.update_id, r.taken, r.students
@@ -180,6 +315,8 @@ class MirrorStore:
                     ORDER BY t.from_date, t.entry->>'fromTime'
                 """, (str(empid), date_from, date_to))
                 rows = cur.fetchall()
+        query_ms = (time.perf_counter() - t0) * 1000
+        _mlog(f"[mirror:cached_course_result] query={query_ms:.1f}ms rows={len(rows)}")
         if not rows:
             return None
 
@@ -263,10 +400,12 @@ class MirrorStore:
             GROUP BY subject_id, subject, division, batch
             ORDER BY subject, division, batch, subject_id
         """
-        with closing(self._connect()) as conn:
+        t0 = time.perf_counter()
+        with self._connect() as conn:
             with conn.cursor() as cur:
                 cur.execute(query, params)
                 rows = cur.fetchall()
+        _mlog(f"[mirror:subjects] query={((time.perf_counter()-t0)*1000):.1f}ms rows={len(rows)}")
         return [{
             "subject_id": row[0], "subject": row[1] or f"Subject {row[0]}",
             "division": row[2], "batch": row[3], "slot_count": row[4],
@@ -281,10 +420,12 @@ class MirrorStore:
             WHERE empid = %s AND from_date BETWEEN %s AND %s
             ORDER BY from_date, entry->>'fromTime'
         """
-        with closing(self._connect()) as conn:
+        t0 = time.perf_counter()
+        with self._connect() as conn:
             with conn.cursor() as cur:
                 cur.execute(query, (str(empid), date_from, date_to))
                 rows = cur.fetchall()
+        _mlog(f"[mirror:get_timetable] query={((time.perf_counter()-t0)*1000):.1f}ms rows={len(rows)}")
         if not rows:
             return None
         now = datetime.now(timezone.utc)
@@ -297,7 +438,7 @@ class MirrorStore:
         if not entries:
             return
         now = datetime.now(timezone.utc)
-        with self._lock, closing(self._connect()) as conn:
+        with self._empid_lock(empid), self._connect() as conn:
             with conn.cursor() as cur:
                 for e in entries:
                     if not isinstance(e, dict) or not e.get("fromDate"):
@@ -340,16 +481,19 @@ class MirrorStore:
         return all_raw
 
     def has_fresh_sync(self, empid, date_from, date_to):
-        with closing(self._connect()) as conn:
+        t0 = time.perf_counter()
+        with self._connect() as conn:
             with conn.cursor() as cur:
                 cur.execute("""
                     SELECT 1 FROM sync_runs
                     WHERE empid = %s AND status = 'done'
                       AND date_from <= %s AND date_to >= %s
                 """, (str(empid), date_from, date_to))
-                return cur.fetchone() is not None
+                result = cur.fetchone() is not None
+        _mlog(f"[mirror:has_fresh_sync] query={((time.perf_counter()-t0)*1000):.1f}ms result={result}")
+        return result
 
-    def save_slot(self, empid, slot_key, entry, roster):
+    def save_slot(self, empid, slot_key, entry, roster, *, bulk=False):
         synced_at = datetime.now(timezone.utc)
         from_date = entry.get("fromDate")
         students = roster.get("students", [])
@@ -358,7 +502,7 @@ class MirrorStore:
             {**student, "present": student.get("admno") in present}
             for student in students
         ]
-        with self._lock, closing(self._connect()) as conn:
+        with self._empid_lock(empid), self._connect() as conn:
             with conn.cursor() as cur:
                 cur.execute("""
                     INSERT INTO timetable_entries (empid, slot_key, from_date, entry, synced_at)
@@ -379,19 +523,121 @@ class MirrorStore:
                             (str(empid), slot_key))
                 cur.executemany("""
                     INSERT INTO attendance_records
-                        (empid, slot_key, student_admno, present, update_id, class_date, synced_at)
-                    VALUES (%s, %s, %s, %s, %s, %s, %s)
+                        (empid, slot_key, student_admno, present, update_id, class_date,
+                         synced_at, student_name, student_avatar, student_rollno)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
                 """, [(str(empid), slot_key, student["admno"],
                         student["admno"] in present, roster.get("update_id"),
-                        from_date, synced_at) for student in students])
+                        from_date, synced_at,
+                        student.get("name"), student.get("avatar_url") or student.get("studImage"),
+                        student.get("rollno")) for student in students])
             conn.commit()
+        self._bump_version(empid, "slot_updated", slot_key, {"slot_key": slot_key})
+
+        if not bulk:
+            affected_admnos = [s.get("admno") for s in students if s.get("admno")]
+            if affected_admnos:
+                summaries = self._compute_summaries(empid, affected_admnos)
+                self._bump_version(empid, "student_summary", None, summaries)
+                attendance = self._compute_student_attendance(empid, affected_admnos)
+                self._bump_version(empid, "student_attendance", None, attendance)
+                low = self._compute_low_attendance(empid)
+                self._bump_version(empid, "low_attendance", None, {"records": low})
+
+    def _compute_summaries(self, empid, admnos):
+        """Compute per-subject attendance summaries for given students."""
+        with self._connect() as conn:
+            with conn.cursor() as cur:
+                cur.execute("""
+                    SELECT a.student_admno, t.entry->>'subjectId',
+                           COALESCE(t.entry->>'subject_full', t.entry->>'sub_shortname'),
+                           COUNT(*) AS total,
+                           COUNT(*) FILTER (WHERE a.present) AS present
+                    FROM attendance_records a
+                    JOIN timetable_entries t USING (empid, slot_key)
+                    WHERE a.empid = %s AND a.student_admno = ANY(%s)
+                    GROUP BY a.student_admno, 2, 3
+                """, (str(empid), list(admnos)))
+                rows = cur.fetchall()
+        summaries = {}
+        for admno, subject_id, subject, total, present in rows:
+            percentage = round(100 * present / total, 1) if total else 0
+            if admno not in summaries:
+                summaries[admno] = []
+            summaries[admno].append({
+                "subject_id": subject_id,
+                "subject": subject or f"Subject {subject_id}",
+                "present": present,
+                "total": total,
+                "absent": total - present,
+                "percentage": percentage,
+                "below_threshold": percentage < 75,
+            })
+        return summaries
+
+    def _compute_student_attendance(self, empid, admnos):
+        """Compute per-student attendance records for given students."""
+        with self._connect() as conn:
+            with conn.cursor() as cur:
+                cur.execute("""
+                    SELECT a.student_admno, a.slot_key, a.class_date, a.present,
+                           a.update_id, t.entry
+                    FROM attendance_records a
+                    JOIN timetable_entries t USING (empid, slot_key)
+                    WHERE a.empid = %s AND a.student_admno = ANY(%s)
+                    ORDER BY a.class_date DESC, t.entry->>'fromTime' DESC
+                """, (str(empid), list(admnos)))
+                rows = cur.fetchall()
+        records = {}
+        for admno, slot_key, class_date, present, update_id, entry in rows:
+            if admno not in records:
+                records[admno] = []
+            records[admno].append({
+                "slot_key": slot_key,
+                "date": class_date.isoformat() if class_date else None,
+                "present": present,
+                "update_id": update_id,
+                "entry": entry,
+            })
+        return records
+
+    def _compute_low_attendance(self, empid, threshold=75):
+        """Compute low attendance records for all students."""
+        with self._connect() as conn:
+            with conn.cursor() as cur:
+                cur.execute("""
+                    SELECT a.student_admno, t.entry->>'subjectId',
+                           COALESCE(t.entry->>'subject_full', t.entry->>'sub_shortname'),
+                           COUNT(*) AS total,
+                           COUNT(*) FILTER (WHERE a.present) AS present,
+                           MAX(a.student_name) AS student_name,
+                           MAX(a.student_avatar) AS avatar_url,
+                           MAX(a.student_rollno) AS rollno
+                    FROM attendance_records a
+                    JOIN timetable_entries t USING (empid, slot_key)
+                    WHERE a.empid = %s
+                    GROUP BY 1, 2, 3
+                """, (str(empid),))
+                rows = cur.fetchall()
+        result = []
+        for admno, subject_id, subject, total, present, name, avatar, rollno in rows:
+            percentage = round(100 * present / total, 1) if total else 0
+            if percentage < threshold:
+                result.append({
+                    "student_admno": admno, "subject_id": subject_id,
+                    "subject": subject or f"Subject {subject_id}",
+                    "name": name, "avatar_url": avatar, "rollno": rollno,
+                    "present": present, "total": total,
+                    "absent": total - present, "percentage": percentage,
+                })
+        return result
 
     def cached_slots(self, empid, slot_keys, max_age_seconds=None,
                      max_age_by_slot=None):
         """Return previously stored roster data keyed by the exact slot key."""
         if not slot_keys:
             return {}
-        with closing(self._connect()) as conn:
+        with self._connect() as conn:
             with conn.cursor() as cur:
                 cur.execute("""
                     SELECT t.slot_key, r.update_id, r.taken, r.students, r.synced_at
@@ -439,10 +685,12 @@ class MirrorStore:
             query += " AND a.class_date <= %s"
             params.append(date_to)
         query += " ORDER BY a.class_date DESC, t.entry->>'fromTime' DESC"
-        with closing(self._connect()) as conn:
+        t0 = time.perf_counter()
+        with self._connect() as conn:
             with conn.cursor() as cur:
                 cur.execute(query, params)
                 rows = cur.fetchall()
+        _mlog(f"[mirror:student_attendance] query={((time.perf_counter()-t0)*1000):.1f}ms rows={len(rows)}")
         return [{
             "slot_key": row[0], "date": row[1].isoformat(),
             "present": row[2], "update_id": row[3], "entry": row[4],
@@ -468,10 +716,12 @@ class MirrorStore:
             query += " AND a.class_date <= %s"
             params.append(date_to)
         query += " GROUP BY a.student_admno, 2, 3 ORDER BY 3, 2"
-        with closing(self._connect()) as conn:
+        t0 = time.perf_counter()
+        with self._connect() as conn:
             with conn.cursor() as cur:
                 cur.execute(query, params)
                 rows = cur.fetchall()
+        _mlog(f"[mirror:student_summary] query={((time.perf_counter()-t0)*1000):.1f}ms rows={len(rows)}")
         result = []
         for _, subject_id, subject, total, present, synced_at in rows:
             percentage = round(100 * present / total, 1) if total else 0
@@ -493,25 +743,11 @@ class MirrorStore:
                    COALESCE(t.entry->>'subject_full', t.entry->>'sub_shortname'),
                    COUNT(*) AS total,
                    COUNT(*) FILTER (WHERE a.present) AS present,
-                   MAX(s.name) AS student_name,
-                   MAX(s.avatar_url) AS avatar_url,
-                   MAX(s.rollno) AS rollno
+                   MAX(a.student_name) AS student_name,
+                   MAX(a.student_avatar) AS avatar_url,
+                   MAX(a.student_rollno) AS rollno
             FROM attendance_records a
             JOIN timetable_entries t USING (empid, slot_key)
-            LEFT JOIN LATERAL (
-                SELECT elem->>'name' AS name,
-                       elem->>'avatar_url' AS avatar_url,
-                       elem->>'rollno' AS rollno
-                FROM jsonb_array_elements(
-                    COALESCE(
-                        (SELECT rs.students FROM roster_snapshots rs
-                         WHERE rs.empid = a.empid AND rs.slot_key = a.slot_key),
-                         '[]'::jsonb
-                    )
-                ) elem
-                WHERE elem->>'admno' = a.student_admno
-                LIMIT 1
-            ) s ON true
             WHERE a.empid = %s
         """
         params = [str(empid)]
@@ -522,10 +758,12 @@ class MirrorStore:
             query += " AND a.class_date <= %s"
             params.append(date_to)
         query += " GROUP BY 1, 2, 3 ORDER BY 5::float / NULLIF(4, 0), 3, 1"
-        with closing(self._connect()) as conn:
+        t0 = time.perf_counter()
+        with self._connect() as conn:
             with conn.cursor() as cur:
                 cur.execute(query, params)
                 rows = cur.fetchall()
+        query_ms = (time.perf_counter() - t0) * 1000
         result = []
         for student_admno, subject_id, subject, total, present, student_name, avatar_url, rollno in rows:
             percentage = round(100 * present / total, 1) if total else 0
@@ -539,6 +777,7 @@ class MirrorStore:
                     "present": present, "total": total,
                     "absent": total - present, "percentage": percentage,
                 })
+        _mlog(f"[mirror:low_attendance] query={query_ms:.1f}ms rows={len(rows)} filtered={len(result)}")
         return result
 
 
