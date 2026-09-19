@@ -829,13 +829,34 @@ async def student_bulk_toggle(sid: str, student_admno: str,
 @router.get("/{sid}/delta")
 def get_delta(sid: str, since_version: int = 0):
     """Return all changes since the given version for delta sync."""
+
     done = _timed_ms("[route:delta]")
+
     client = get_client(sid)
+
     done("get_client")
+
     if mirror is None:
         raise HTTPException(503, "attendance mirror is not configured")
+
     result = mirror.get_delta(client.empid, since_version)
+
+    # Save delta for inspection
     import json
+    from pathlib import Path
+
+    debug_dir = Path("debug_deltas")
+    debug_dir.mkdir(exist_ok=True)
+
+    with open(debug_dir / f"delta_{client.empid}_{since_version}.json", "w") as f:
+        json.dump(result, f, indent=2, default=str)
+
     size = len(json.dumps(result, default=str))
-    done(f"changes={len(result.get('changes', []))} version={result.get('version', 0)} size={size}bytes")
+
+    done(
+        f"changes={len(result.get('changes', []))} "
+        f"version={result.get('version', 0)} "
+        f"size={size}bytes"
+    )
+
     return result
