@@ -493,11 +493,15 @@ class MirrorStore:
                    COALESCE(t.entry->>'subject_full', t.entry->>'sub_shortname'),
                    COUNT(*) AS total,
                    COUNT(*) FILTER (WHERE a.present) AS present,
-                   MAX(s.name) AS student_name
+                   MAX(s.name) AS student_name,
+                   MAX(s.avatar_url) AS avatar_url,
+                   MAX(s.rollno) AS rollno
             FROM attendance_records a
             JOIN timetable_entries t USING (empid, slot_key)
             LEFT JOIN LATERAL (
-                SELECT elem->>'name' AS name
+                SELECT elem->>'name' AS name,
+                       elem->>'avatar_url' AS avatar_url,
+                       elem->>'rollno' AS rollno
                 FROM jsonb_array_elements(
                     COALESCE(
                         (SELECT rs.students FROM roster_snapshots rs
@@ -523,13 +527,15 @@ class MirrorStore:
                 cur.execute(query, params)
                 rows = cur.fetchall()
         result = []
-        for student_admno, subject_id, subject, total, present, student_name in rows:
+        for student_admno, subject_id, subject, total, present, student_name, avatar_url, rollno in rows:
             percentage = round(100 * present / total, 1) if total else 0
             if percentage < threshold:
                 result.append({
                     "student_admno": student_admno, "subject_id": subject_id,
                     "subject": subject or f"Subject {subject_id}",
                     "name": student_name,
+                    "avatar_url": avatar_url,
+                    "rollno": rollno,
                     "present": present, "total": total,
                     "absent": total - present, "percentage": percentage,
                 })

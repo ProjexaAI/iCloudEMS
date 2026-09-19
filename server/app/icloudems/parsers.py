@@ -245,6 +245,7 @@ def parse_roster(response):
             "rollno": str(display),
             "admno": str(internal),
             "name": name or "",
+            "avatar_url": s.get("avatar_url") or s.get("studImage") or "",
             "present": present,
             "known": absent is not None,
         })
